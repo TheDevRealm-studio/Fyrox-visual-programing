@@ -149,6 +149,7 @@ use crate::{
     plugins::{
         absm::{AbsmEditor, AbsmEditorPlugin},
         animation::AnimationEditorPlugin,
+        blueprint::BlueprintEditorPlugin,
         collider::ColliderPlugin,
         curve_editor::CurveEditorPlugin,
         material::MaterialPlugin,
@@ -814,6 +815,13 @@ impl Editor {
         })
         .unwrap();
 
+        // Register Blueprint (.blueprint) resources + BlueprintScript in the editor runtime.
+        // This keeps the editor self-contained (no game plugin required).
+        fyrox_blueprint::register_resources(&engine.resource_manager);
+        fyrox_blueprint::register(&engine.serialization_context.script_constructors);
+        // Engine already scanned the registry during init; rescan to pick up new extensions.
+        engine.resource_manager.state().update_or_load_registry();
+
         let (message_sender, message_receiver) = mpsc::channel();
         let message_sender = MessageSender(message_sender);
 
@@ -1079,6 +1087,7 @@ impl Editor {
                 .with(ColliderPlugin::default())
                 .with(TileMapEditorPlugin::default())
                 .with(MaterialPlugin::default())
+                .with(BlueprintEditorPlugin::default())
                 .with(RagdollPlugin::default())
                 .with(SettingsPlugin::default())
                 .with(AnimationEditorPlugin::default())

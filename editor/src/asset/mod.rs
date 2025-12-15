@@ -32,9 +32,10 @@ use crate::{
     },
     fyrox::{
         asset::{manager::ResourceManager, options::BaseImportOptions},
+        asset::untyped::{ResourceKind, UntypedResource},
         core::{
             append_extension, err, futures::executor::block_on, log::Log, make_relative_path,
-            ok_or_continue, pool::Handle, some_or_continue, SafeLock,
+            ok_or_continue, pool::Handle, some_or_continue, SafeLock, Uuid,
         },
         engine::Engine,
         graph::{BaseSceneGraph, SceneGraph},
@@ -70,6 +71,7 @@ use crate::{
 };
 use fyrox::asset::event::ResourceEvent;
 use fyrox::gui::text_box::EmptyTextPlaceholder;
+use fyrox_blueprint::{BlueprintAsset, BlueprintLoader};
 use menu::AssetItemContextMenu;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::sync::mpsc::Receiver;
@@ -143,6 +145,24 @@ fn make_unique_path(parent: &Path, stem: &str, ext: &str) -> PathBuf {
     }
 }
 
+fn make_unique_new_path(parent: &Path, stem: &str, ext: &str) -> PathBuf {
+    let mut i = 0u32;
+    loop {
+        let file_name = if i == 0 {
+            format!("{stem}.{ext}")
+        } else {
+            format!("{stem}_{i}.{ext}")
+        };
+
+        let path = parent.join(file_name);
+        if !path.exists() {
+            return path;
+        }
+
+        i += 1;
+    }
+}
+
 struct InspectorAddon {
     root: Handle<UiNode>,
     apply: Handle<UiNode>,
@@ -158,6 +178,7 @@ pub struct AssetBrowser {
     scroll_panel: Handle<UiNode>,
     search_bar: Handle<UiNode>,
     add_resource: Handle<UiNode>,
+    add_blueprint: Handle<UiNode>,
     refresh: Handle<UiNode>,
     items: Vec<Handle<UiNode>>,
     item_to_select: Option<PathBuf>,
@@ -295,6 +316,32 @@ impl AssetBrowser {
         .with_text("+")
         .build(ctx);
 
+        let add_blueprint = ButtonBuilder::new(
+            WidgetBuilder::new()
+                .with_tab_index(Some(1))
+                .with_height(24.0)
+                .with_width(24.0)
+                .with_margin(Thickness::uniform(1.0))
+                .with_tooltip(make_simple_tooltip(ctx, "Add New Blueprint")),
+        )
+        .with_back(
+            DecoratorBuilder::new(
+                BorderBuilder::new(
+                    WidgetBuilder::new().with_foreground(ctx.style.property(Style::BRUSH_DARKER)),
+                )
+                .with_pad_by_corner_radius(false)
+                .with_corner_radius(ctx.style.property(Button::CORNER_RADIUS))
+                .with_stroke_thickness(ctx.style.property(Button::BORDER_THICKNESS)),
+            )
+            .with_normal_brush(ctx.style.property(Self::ADD_ASSET_NORMAL_BRUSH))
+            .with_hover_brush(ctx.style.property(Self::ADD_ASSET_HOVER_BRUSH))
+            .with_pressed_brush(ctx.style.property(Self::ADD_ASSET_PRESSED_BRUSH))
+            .build(ctx),
+        )
+        .with_text("BP")
+        .build(ctx);
+        ctx[add_blueprint].set_column(1);
+
         let resave_resources = make_square_image_button_with_tooltip(
             ctx,
             load_image!("../../resources/resave.png"),
@@ -302,7 +349,7 @@ impl AssetBrowser {
             Use for assets migration from the previous versions of the engine",
             None,
         );
-        ctx[resave_resources].set_column(2);
+        ctx[resave_resources].set_column(3);
 
         let refresh = make_square_image_button_with_tooltip(
             ctx,
@@ -310,12 +357,12 @@ impl AssetBrowser {
             "Refresh",
             Some(1),
         );
-        ctx[refresh].set_column(1);
+        ctx[refresh].set_column(2);
 
         let search_bar = SearchBarBuilder::new(
             WidgetBuilder::new()
                 .with_tab_index(Some(2))
-                .on_column(3)
+                .on_column(4)
                 .with_margin(Thickness::uniform(1.0)),
         )
         .with_empty_text_placeholder(EmptyTextPlaceholder::Text("Search for an asset"))
@@ -324,10 +371,12 @@ impl AssetBrowser {
         let toolbar = GridBuilder::new(
             WidgetBuilder::new()
                 .with_child(add_resource)
+                .with_child(add_blueprint)
                 .with_child(refresh)
                 .with_child(resave_resources)
                 .with_child(search_bar),
         )
+        .add_column(Column::auto())
         .add_column(Column::auto())
         .add_column(Column::auto())
         .add_column(Column::auto())
@@ -439,6 +488,7 @@ impl AssetBrowser {
             context_menu,
             current_path: Default::default(),
             add_resource,
+            add_blueprint,
             resource_creator: None,
             preview_cache: AssetPreviewCache::new(preview_receiver, 4),
             preview_sender,
@@ -552,6 +602,10 @@ impl AssetBrowser {
         );
         ui.send(
             self.add_resource,
+            WidgetMessage::Enabled(self.is_current_path_in_registry(resource_manager)),
+        );
+        ui.send(
+            self.add_blueprint,
             WidgetMessage::Enabled(self.is_current_path_in_registry(resource_manager)),
         );
         self.schedule_refresh();
@@ -860,6 +914,35 @@ impl AssetBrowser {
                 resource_creator.open(engine.user_interfaces.first());
 
                 self.resource_creator = Some(resource_creator);
+            } else if message.destination() == self.add_blueprint {
+                if !self.is_current_path_in_registry(&engine.resource_manager) {
+                    return;
+                }
+
+                let path = make_unique_new_path(
+                    &self.current_path,
+                    "Blueprint",
+                    BlueprintLoader::EXT,
+                );
+
+                let mut instance = Box::new(BlueprintAsset::default())
+                    as Box<dyn fyrox::asset::ResourceData>;
+
+                match instance.save(&path) {
+                    Ok(_) => {
+                        let resource = UntypedResource::new_ok_untyped(
+                            Uuid::new_v4(),
+                            ResourceKind::External,
+                            instance,
+                        );
+
+                        Log::verify(engine.resource_manager.register(resource, path));
+                        sender.send(Message::ForceSync);
+                    }
+                    Err(e) => {
+                        Log::err(format!("Unable to create blueprint asset. Reason: {e:?}"))
+                    }
+                }
             } else if message.destination() == self.refresh {
                 self.schedule_refresh();
             } else if message.destination() == self.resave_resources {

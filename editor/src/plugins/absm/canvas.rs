@@ -56,19 +56,19 @@ use std::{
 };
 
 #[derive(Debug, Clone, PartialEq, Visit, Reflect, Default)]
-pub(crate) struct Entry {
+pub struct Entry {
     pub node: Handle<UiNode>,
     pub initial_position: Vector2<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Visit, Reflect, Default)]
-pub(crate) struct DragContext {
+pub struct DragContext {
     initial_cursor_position: Vector2<f32>,
     entries: Vec<Entry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Visit, Reflect)]
-pub(crate) enum Mode {
+pub enum Mode {
     Normal,
     Drag {
         drag_context: DragContext,
@@ -86,7 +86,7 @@ pub(crate) enum Mode {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum AbsmCanvasMessage {
+pub enum AbsmCanvasMessage {
     SwitchMode(Mode),
     CommitTransition {
         source_node: Handle<UiNode>,
@@ -317,19 +317,30 @@ impl Control for AbsmCanvas {
             .bounding_rect()
             .inflate(grid_size, grid_size)
             .translate(Vector2::new(grid_size * 0.5, grid_size * 0.5));
+        // Dark background like Unreal's Blueprint editor.
         ctx.push_rect_filled(&grid_bounds, None);
         ctx.commit(
             self.clip_bounds(),
-            self.widget.background(),
+            Brush::Solid(Color::opaque(28, 28, 28)),
             CommandTexture::None,
             &self.material,
             None,
         );
 
-        ctx.push_grid(self.zoom, Vector2::repeat(50.0), grid_bounds);
+        // Unreal-like grid: subtle minor lines + slightly stronger major lines.
+        ctx.push_grid(self.zoom, Vector2::repeat(16.0), grid_bounds);
         ctx.commit(
             self.clip_bounds(),
-            Brush::Solid(Color::opaque(60, 60, 60)),
+            Brush::Solid(Color::opaque(38, 38, 38)),
+            CommandTexture::None,
+            &self.material,
+            None,
+        );
+
+        ctx.push_grid(self.zoom, Vector2::repeat(80.0), grid_bounds);
+        ctx.commit(
+            self.clip_bounds(),
+            Brush::Solid(Color::opaque(52, 52, 52)),
             CommandTexture::None,
             &self.material,
             None,
@@ -361,6 +372,7 @@ impl Control for AbsmCanvas {
                     *dest_pos,
                     self.clip_bounds(),
                     Brush::Solid(Color::WHITE),
+                    5.0,
                     &self.material,
                 );
             }

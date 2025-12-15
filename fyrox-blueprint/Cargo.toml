@@ -1,0 +1,10 @@
+[package]
+name = "fyrox-blueprint"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+fyrox = { path = "../fyrox" }
+fyrox-visual-scripting = { path = "../fyrox-visual-scripting" }
+serde_json = "1"
+

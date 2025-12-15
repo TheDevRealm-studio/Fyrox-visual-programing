@@ -21,7 +21,7 @@
 use crate::fyrox::core::pool::ErasedHandle;
 use crate::fyrox::{
     core::{
-        algebra::Vector2, pool::Handle, reflect::prelude::*, type_traits::prelude::*,
+        algebra::Vector2, color::Color, pool::Handle, reflect::prelude::*, type_traits::prelude::*,
         uuid_provider, visitor::prelude::*,
     },
     gui::{
@@ -70,7 +70,7 @@ pub struct Socket {
 
 define_widget_deref!(Socket);
 
-const RADIUS: f32 = 8.0;
+const RADIUS: f32 = 6.0;
 
 uuid_provider!(Socket = "a6c0473e-7073-4e91-a681-cf88795af52a");
 
@@ -131,6 +131,7 @@ pub struct SocketBuilder {
     editor: Handle<UiNode>,
     index: usize,
     show_index: bool,
+    pin_color: Option<Color>,
 }
 
 impl SocketBuilder {
@@ -142,6 +143,7 @@ impl SocketBuilder {
             editor: Default::default(),
             index: 0,
             show_index: true,
+            pin_color: None,
         }
     }
 
@@ -171,52 +173,79 @@ impl SocketBuilder {
         self
     }
 
+    pub fn with_pin_color(mut self, color: Color) -> Self {
+        self.pin_color = Some(color);
+        self
+    }
+
     pub fn build(self, ctx: &mut BuildContext) -> Handle<UiNode> {
         if let Some(editor) = ctx.try_get_node_mut(self.editor) {
-            editor.set_row(0).set_column(1);
+            editor.set_row(0).set_column(match self.direction {
+                SocketDirection::Input => 1,
+                SocketDirection::Output => 0,
+            });
         }
 
         let pin;
-        let grid = GridBuilder::new(
+
+        // Use provided pin color, or default to style.
+        use crate::fyrox::gui::brush::Brush;
+        let pin_foreground = self
+            .pin_color
+            .map(|c| Brush::Solid(c).into())
+            .unwrap_or_else(|| ctx.style.property(Style::BRUSH_BRIGHT));
+
+        let pin_stack = StackPanelBuilder::new(
             WidgetBuilder::new()
-                .with_child(
-                    StackPanelBuilder::new(
+                .with_child({
+                    pin = VectorImageBuilder::new(
                         WidgetBuilder::new()
-                            .with_child({
-                                pin = VectorImageBuilder::new(
-                                    WidgetBuilder::new()
-                                        .on_row(0)
-                                        .on_column(0)
-                                        .with_foreground(ctx.style.property(Style::BRUSH_BRIGHT)),
-                                )
-                                .with_primitives(vec![Primitive::Circle {
-                                    center: Vector2::new(RADIUS, RADIUS),
-                                    radius: RADIUS,
-                                    segments: 16,
-                                }])
-                                .build(ctx);
-                                pin
-                            })
-                            .with_child(if self.show_index {
-                                TextBuilder::new(
-                                    WidgetBuilder::new().with_margin(Thickness::left(2.0)),
-                                )
-                                .with_vertical_text_alignment(VerticalAlignment::Center)
-                                .with_text(format!("{:?}", self.index))
-                                .build(ctx)
-                            } else {
-                                Handle::NONE
-                            }),
+                            .on_row(0)
+                            .on_column(0)
+                            .with_foreground(pin_foreground),
                     )
-                    .with_orientation(Orientation::Horizontal)
-                    .build(ctx),
-                )
-                .with_child(self.editor),
+                    .with_primitives(vec![Primitive::Circle {
+                        center: Vector2::new(RADIUS, RADIUS),
+                        radius: RADIUS,
+                        segments: 16,
+                    }])
+                    .build(ctx);
+                    pin
+                })
+                .with_child(if self.show_index {
+                    TextBuilder::new(WidgetBuilder::new().with_margin(Thickness::left(2.0)))
+                        .with_vertical_text_alignment(VerticalAlignment::Center)
+                        .with_text(format!("{:?}", self.index))
+                        .build(ctx)
+                } else {
+                    Handle::NONE
+                }),
         )
-        .add_row(Row::auto())
-        .add_column(Column::auto())
-        .add_column(Column::stretch())
+        .with_orientation(Orientation::Horizontal)
         .build(ctx);
+
+        let grid = match self.direction {
+            SocketDirection::Input => GridBuilder::new(
+                WidgetBuilder::new().with_child(pin_stack).with_child(self.editor),
+            )
+            .add_row(Row::auto())
+            .add_column(Column::auto())
+            .add_column(Column::stretch())
+            .build(ctx),
+            SocketDirection::Output => GridBuilder::new(
+                WidgetBuilder::new()
+                    .with_child(self.editor)
+                    .with_child({
+                        ctx.try_get_node_mut(pin_stack)
+                            .map(|n| n.set_row(0).set_column(1));
+                        pin_stack
+                    }),
+            )
+            .add_row(Row::auto())
+            .add_column(Column::stretch())
+            .add_column(Column::auto())
+            .build(ctx),
+        };
 
         let socket = Socket {
             widget: self.widget_builder.with_child(grid).build(ctx),

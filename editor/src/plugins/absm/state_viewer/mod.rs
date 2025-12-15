@@ -662,7 +662,14 @@ impl StateViewer {
                             WidgetBuilder::new()
                                 .with_context_menu(self.connection_context_menu.menu.clone()),
                         )
-                        .with_source_socket(source.base.output_socket)
+                        .with_source_socket(
+                            source
+                                .base
+                                .output_sockets
+                                .first()
+                                .copied()
+                                .unwrap_or_default(),
+                        )
                         .with_source_node(source.handle())
                         .with_dest_socket(input_sockets[i])
                         .with_dest_node(dest_handle)

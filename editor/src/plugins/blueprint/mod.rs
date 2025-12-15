@@ -1,0 +1,1997 @@
+use crate::{
+    fyrox::{
+        asset::manager::ResourceManager,
+        asset::ResourceData,
+        core::{
+            futures::executor::block_on,
+            log::Log,
+            make_relative_path,
+            pool::{ErasedHandle, Handle, Pool},
+            reflect::prelude::*,
+            uuid::Uuid,
+        },
+        engine::Engine,
+        graph::BaseSceneGraph,
+        gui::{
+            button::{ButtonBuilder, ButtonMessage},
+            dock::{DockingManagerBuilder, DockingManagerMessage, TileBuilder, TileContent},
+            dropdown_list::{DropdownListBuilder, DropdownListMessage},
+            grid::{Column, GridBuilder, Row},
+            message::UiMessage,
+            scroll_viewer::ScrollViewerBuilder,
+            stack_panel::StackPanelBuilder,
+            tab_control::{TabControlBuilder, TabControlMessage, TabDefinition},
+            text::TextBuilder,
+            text::TextMessage,
+            text_box::{TextBoxBuilder},
+            utils::make_dropdown_list_option,
+            widget::{WidgetBuilder, WidgetMessage},
+            window::{WindowBuilder, WindowMessage, WindowTitle},
+            BuildContext, HorizontalAlignment, Orientation, Thickness, UiNode, UserInterface,
+        },
+    },
+    plugin::EditorPlugin,
+    Editor, Message,
+};
+use fyrox::gui::window::WindowAlignment;
+use fyrox_blueprint::BlueprintAsset;
+use fyrox_visual_scripting::{
+    compile, BlueprintGraph, BuiltinNodeKind, DataType, GraphKind, Link, Node, NodeId, PinDirection,
+    PinId, Value,
+};
+use fyrox_visual_scripting::model::VariableDef;
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
+
+use crate::plugins::absm::{
+    canvas::AbsmCanvasBuilder,
+    canvas::AbsmCanvasMessage,
+    connection::ConnectionBuilder,
+    node::{AbsmNodeBuilder, AbsmNodeLayout},
+    socket::{Socket, SocketBuilder, SocketDirection},
+};
+
+#[derive(Clone, Debug, Reflect)]
+struct BlueprintNodeModel {
+    node_id: u32,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum BlueprintGraphTab {
+    EventGraph,
+    ConstructionScript,
+}
+
+fn tab_graph_name(tab: BlueprintGraphTab) -> &'static str {
+    match tab {
+        BlueprintGraphTab::EventGraph => "EventGraph",
+        BlueprintGraphTab::ConstructionScript => "ConstructionScript",
+    }
+}
+
+struct GraphView {
+    canvas: Handle<UiNode>,
+    models: Pool<BlueprintNodeModel>,
+
+    node_views: HashMap<NodeId, Handle<UiNode>>,
+    view_to_node: HashMap<Handle<UiNode>, NodeId>,
+    pin_to_socket: HashMap<PinId, Handle<UiNode>>,
+    socket_to_pin: HashMap<Handle<UiNode>, PinId>,
+    pin_to_node: HashMap<PinId, NodeId>,
+    node_primary_text_box_by_node: HashMap<NodeId, Handle<UiNode>>,
+    node_text_box_binding: HashMap<Handle<UiNode>, (NodeId, String)>,
+    connection_views: Vec<Handle<UiNode>>,
+    node_view_handles: Vec<Handle<UiNode>>,
+}
+
+impl GraphView {
+    fn new(canvas: Handle<UiNode>) -> Self {
+        Self {
+            canvas,
+            models: Pool::new(),
+            node_views: HashMap::new(),
+            view_to_node: HashMap::new(),
+            pin_to_socket: HashMap::new(),
+            socket_to_pin: HashMap::new(),
+            pin_to_node: HashMap::new(),
+            node_primary_text_box_by_node: HashMap::new(),
+            node_text_box_binding: HashMap::new(),
+            connection_views: Vec::new(),
+            node_view_handles: Vec::new(),
+        }
+    }
+
+    fn clear_ui(&mut self, ui: &UserInterface) {
+        for h in self
+            .connection_views
+            .iter()
+            .chain(self.node_view_handles.iter())
+            .cloned()
+        {
+            ui.send(h, WidgetMessage::Remove);
+        }
+
+        self.models.clear();
+        self.node_views.clear();
+        self.view_to_node.clear();
+        self.pin_to_socket.clear();
+        self.socket_to_pin.clear();
+        self.pin_to_node.clear();
+        self.node_primary_text_box_by_node.clear();
+        self.node_text_box_binding.clear();
+        self.connection_views.clear();
+        self.node_view_handles.clear();
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum DetailsBinding {
+    NodeProp { node: NodeId, key: &'static str },
+    VariableName { index: usize },
+    VariableType { index: usize },
+}
+
+struct BlueprintEditor {
+    window: fyrox::core::pool::Handle<UiNode>,
+    save: fyrox::core::pool::Handle<UiNode>,
+    tab_control: fyrox::core::pool::Handle<UiNode>,
+
+    my_blueprint_graphs_event: fyrox::core::pool::Handle<UiNode>,
+    my_blueprint_graphs_construction: fyrox::core::pool::Handle<UiNode>,
+    my_blueprint_new_graph: fyrox::core::pool::Handle<UiNode>,
+    my_blueprint_graphs_panel: fyrox::core::pool::Handle<UiNode>,
+    my_blueprint_graph_widgets: Vec<Handle<UiNode>>,
+    my_blueprint_graph_select: HashMap<Handle<UiNode>, usize>,
+    my_blueprint_new_variable: fyrox::core::pool::Handle<UiNode>,
+    my_blueprint_variables_panel: fyrox::core::pool::Handle<UiNode>,
+    my_blueprint_variable_widgets: Vec<Handle<UiNode>>,
+    my_blueprint_variable_select: HashMap<Handle<UiNode>, usize>,
+    my_blueprint_variable_get: HashMap<Handle<UiNode>, usize>,
+    my_blueprint_variable_set: HashMap<Handle<UiNode>, usize>,
+
+    my_blueprint_new_function: fyrox::core::pool::Handle<UiNode>,
+    my_blueprint_functions_panel: fyrox::core::pool::Handle<UiNode>,
+    my_blueprint_function_widgets: Vec<Handle<UiNode>>,
+    my_blueprint_function_select: HashMap<Handle<UiNode>, usize>,
+
+    details_panel: fyrox::core::pool::Handle<UiNode>,
+    details_widgets: Vec<Handle<UiNode>>,
+    details_bindings: HashMap<Handle<UiNode>, DetailsBinding>,
+    selected_node: Option<NodeId>,
+    selected_variable: Option<usize>,
+
+    active_tab: BlueprintGraphTab,
+    active_extra_tab: Option<usize>,
+
+    path: Option<PathBuf>,
+    version: u32,
+    graph: BlueprintGraph,
+
+    event_view: GraphView,
+    construction_view: GraphView,
+
+    extra_tabs: Vec<ExtraTab>,
+}
+
+struct ExtraTab {
+    uuid: Uuid,
+    name: String,
+    kind: GraphKind,
+    view: GraphView,
+}
+
+impl BlueprintEditor {
+    fn active_graph_name(&self) -> &str {
+        if let Some(extra) = self.active_extra_tab.and_then(|i| self.extra_tabs.get(i)) {
+            return extra.name.as_str();
+        }
+        tab_graph_name(self.active_tab)
+    }
+
+    fn new(engine: &mut Engine) -> Self {
+        let ctx = &mut engine.user_interfaces.first_mut().build_ctx();
+
+        let save;
+        let my_blueprint_graphs_event;
+        let my_blueprint_graphs_construction;
+        let my_blueprint_new_graph;
+        let my_blueprint_graphs_panel;
+        let my_blueprint_new_variable;
+        let my_blueprint_variables_panel;
+        let my_blueprint_new_function;
+        let my_blueprint_functions_panel;
+        let details_panel;
+
+        let event_canvas;
+        let construction_canvas;
+
+        let tab_control;
+
+        let toolbar = StackPanelBuilder::new(
+            WidgetBuilder::new()
+                .on_row(0)
+                .with_margin(Thickness::uniform(2.0))
+                .with_horizontal_alignment(HorizontalAlignment::Right)
+                .with_child({
+                    save = ButtonBuilder::new(WidgetBuilder::new().with_width(120.0).with_height(24.0))
+                        .with_text("Save")
+                        .build(ctx);
+                    save
+                }),
+        )
+        .with_orientation(Orientation::Horizontal)
+        .build(ctx);
+
+        let components_window = WindowBuilder::new(WidgetBuilder::new().with_width(260.0).with_height(260.0))
+            .can_close(false)
+            .can_minimize(false)
+            .with_title(WindowTitle::text("Components"))
+            .with_content(
+                TextBuilder::new(WidgetBuilder::new().with_margin(Thickness::uniform(4.0)))
+                    .with_text("(MVP) Components panel")
+                    .build(ctx),
+            )
+            .build(ctx);
+
+        let my_blueprint_window = WindowBuilder::new(WidgetBuilder::new().with_width(260.0).with_height(340.0))
+            .can_close(false)
+            .can_minimize(false)
+            .with_title(WindowTitle::text("My Blueprint"))
+            .with_content(
+                StackPanelBuilder::new(
+                    WidgetBuilder::new()
+                        .with_margin(Thickness::uniform(4.0))
+                        .with_child(
+                            TextBuilder::new(WidgetBuilder::new().with_margin(Thickness::uniform(2.0)))
+                                .with_text("GRAPHS")
+                                .build(ctx),
+                        )
+                        .with_child({
+                            my_blueprint_new_graph = ButtonBuilder::new(
+                                WidgetBuilder::new().with_height(24.0),
+                            )
+                            .with_text("+ Graph")
+                            .build(ctx);
+                            my_blueprint_new_graph
+                        })
+                        .with_child({
+                            my_blueprint_graphs_event = ButtonBuilder::new(
+                                WidgetBuilder::new().with_height(24.0),
+                            )
+                            .with_text("EventGraph")
+                            .build(ctx);
+                            my_blueprint_graphs_event
+                        })
+                        .with_child({
+                            my_blueprint_graphs_construction = ButtonBuilder::new(
+                                WidgetBuilder::new().with_height(24.0),
+                            )
+                            .with_text("ConstructionScript")
+                            .build(ctx);
+                            my_blueprint_graphs_construction
+                        })
+                        .with_child({
+                            my_blueprint_graphs_panel = StackPanelBuilder::new(
+                                WidgetBuilder::new().with_margin(Thickness::uniform(2.0)),
+                            )
+                            .with_orientation(Orientation::Vertical)
+                            .build(ctx);
+                            my_blueprint_graphs_panel
+                        })
+                        .with_child(
+                            TextBuilder::new(WidgetBuilder::new().with_margin(Thickness::uniform(6.0)))
+                                .with_text("VARIABLES")
+                                .build(ctx),
+                        )
+                        .with_child({
+                            my_blueprint_new_variable = ButtonBuilder::new(
+                                WidgetBuilder::new().with_height(24.0),
+                            )
+                            .with_text("+ Variable")
+                            .build(ctx);
+                            my_blueprint_new_variable
+                        })
+                        .with_child({
+                            my_blueprint_variables_panel = StackPanelBuilder::new(
+                                WidgetBuilder::new().with_margin(Thickness::uniform(2.0)),
+                            )
+                            .with_orientation(Orientation::Vertical)
+                            .build(ctx);
+                            my_blueprint_variables_panel
+                        })
+                        .with_child(
+                            TextBuilder::new(WidgetBuilder::new().with_margin(Thickness::uniform(6.0)))
+                                .with_text("FUNCTIONS")
+                                .build(ctx),
+                        )
+                        .with_child({
+                            my_blueprint_new_function = ButtonBuilder::new(
+                                WidgetBuilder::new().with_height(24.0),
+                            )
+                            .with_text("+ Function")
+                            .build(ctx);
+                            my_blueprint_new_function
+                        })
+                        .with_child({
+                            my_blueprint_functions_panel = StackPanelBuilder::new(
+                                WidgetBuilder::new().with_margin(Thickness::uniform(2.0)),
+                            )
+                            .with_orientation(Orientation::Vertical)
+                            .build(ctx);
+                            my_blueprint_functions_panel
+                        }),
+                )
+                .with_orientation(Orientation::Vertical)
+                .build(ctx),
+            )
+            .build(ctx);
+
+        event_canvas = AbsmCanvasBuilder::new(WidgetBuilder::new()).build(ctx);
+        construction_canvas = AbsmCanvasBuilder::new(WidgetBuilder::new()).build(ctx);
+
+        tab_control = TabControlBuilder::new(WidgetBuilder::new())
+            .with_tab(make_tab("Event Graph", event_canvas, ctx))
+            .with_tab(make_tab("Construction Script", construction_canvas, ctx))
+            .build(ctx);
+
+        let graph_window = WindowBuilder::new(WidgetBuilder::new())
+            .can_close(false)
+            .can_minimize(false)
+            .with_title(WindowTitle::text("Graph"))
+            .with_content(tab_control)
+            .build(ctx);
+
+        details_panel = StackPanelBuilder::new(WidgetBuilder::new().with_margin(Thickness::uniform(4.0)))
+            .build(ctx);
+
+        let details_window = WindowBuilder::new(WidgetBuilder::new().with_width(320.0))
+            .can_close(false)
+            .can_minimize(false)
+            .with_title(WindowTitle::text("Details"))
+            .with_content(
+                ScrollViewerBuilder::new(WidgetBuilder::new())
+                    .with_content(details_panel)
+                    .build(ctx),
+            )
+            .build(ctx);
+
+        let docking_manager = DockingManagerBuilder::new(WidgetBuilder::new().on_row(1).with_child({
+            TileBuilder::new(WidgetBuilder::new())
+                .with_content(TileContent::HorizontalTiles {
+                    splitter: 0.75,
+                    tiles: [
+                        TileBuilder::new(WidgetBuilder::new())
+                            .with_content(TileContent::VerticalTiles {
+                                splitter: 0.45,
+                                tiles: [
+                                    TileBuilder::new(WidgetBuilder::new())
+                                        .with_content(TileContent::Window(components_window))
+                                        .build(ctx),
+                                    TileBuilder::new(WidgetBuilder::new())
+                                        .with_content(TileContent::Window(my_blueprint_window))
+                                        .build(ctx),
+                                ],
+                            })
+                            .build(ctx),
+                        TileBuilder::new(WidgetBuilder::new())
+                            .with_content(TileContent::HorizontalTiles {
+                                splitter: 0.70,
+                                tiles: [
+                                    TileBuilder::new(WidgetBuilder::new())
+                                        .with_content(TileContent::Window(graph_window))
+                                        .build(ctx),
+                                    TileBuilder::new(WidgetBuilder::new())
+                                        .with_content(TileContent::Window(details_window))
+                                        .build(ctx),
+                                ],
+                            })
+                            .build(ctx),
+                    ],
+                })
+                .build(ctx)
+        }))
+        .build(ctx);
+
+        let content = GridBuilder::new(
+            WidgetBuilder::new()
+                .with_child(toolbar)
+                .with_child(docking_manager),
+        )
+        .add_row(Row::auto())
+        .add_row(Row::stretch())
+        .add_column(Column::stretch())
+        .build(ctx);
+
+        let window = WindowBuilder::new(WidgetBuilder::new().with_width(900.0).with_height(600.0))
+            .with_title(WindowTitle::text("Blueprint"))
+            .open(false)
+            .with_content(content)
+            .build(ctx);
+
+        Self {
+            window,
+            save,
+            tab_control,
+
+            my_blueprint_graphs_event,
+            my_blueprint_graphs_construction,
+            my_blueprint_new_graph,
+            my_blueprint_graphs_panel,
+            my_blueprint_graph_widgets: Vec::new(),
+            my_blueprint_graph_select: HashMap::new(),
+            my_blueprint_new_variable,
+            my_blueprint_variables_panel,
+            my_blueprint_variable_widgets: Vec::new(),
+            my_blueprint_variable_select: HashMap::new(),
+            my_blueprint_variable_get: HashMap::new(),
+            my_blueprint_variable_set: HashMap::new(),
+
+            my_blueprint_new_function,
+            my_blueprint_functions_panel,
+            my_blueprint_function_widgets: Vec::new(),
+            my_blueprint_function_select: HashMap::new(),
+
+            details_panel,
+            details_widgets: Vec::new(),
+            details_bindings: HashMap::new(),
+            selected_node: None,
+            selected_variable: None,
+
+            active_tab: BlueprintGraphTab::EventGraph,
+            active_extra_tab: None,
+
+            path: None,
+            version: 1,
+            graph: BlueprintGraph::new(fyrox_visual_scripting::GraphId("Blueprint".to_string())),
+
+            event_view: GraphView::new(event_canvas),
+            construction_view: GraphView::new(construction_canvas),
+
+            extra_tabs: Vec::new(),
+        }
+    }
+
+    fn close_all_extra_tabs(&mut self, ui: &mut UserInterface) {
+        self.active_extra_tab = None;
+
+        for mut tab in self.extra_tabs.drain(..) {
+            tab.view.clear_ui(ui);
+            ui.send(self.tab_control, TabControlMessage::RemoveTabByUuid(tab.uuid));
+        }
+    }
+
+    fn open(&mut self, editor: &mut Editor, path: PathBuf) {
+        self.path = Some(path);
+
+        if let Some(path) = self.path.as_ref() {
+            let title = path
+                .file_name()
+                .map(|n| format!("Blueprint - {}", n.to_string_lossy()))
+                .unwrap_or_else(|| "Blueprint".to_string());
+
+            let ui = editor.engine.user_interfaces.first_mut();
+            ui.send(
+                self.window,
+                WindowMessage::Title(WindowTitle::text(title)),
+            );
+
+            self.reload_from_resource(&editor.engine.resource_manager, ui);
+        }
+
+        let ui = editor.engine.user_interfaces.first_mut();
+        ui.send(
+            self.window,
+            WindowMessage::Open {
+                alignment: WindowAlignment::Center,
+                modal: false,
+                focus_content: true,
+            },
+        );
+        ui.send(
+            editor.docking_manager,
+            DockingManagerMessage::AddFloatingWindow(self.window),
+        );
+    }
+
+    fn reload_from_resource(&mut self, resource_manager: &ResourceManager, ui: &mut UserInterface) {
+        // Extra tabs belong to a single opened blueprint; discard them on reload.
+        self.close_all_extra_tabs(ui);
+
+        let Some(path) = self.path.as_ref() else {
+            return;
+        };
+
+        let Ok(relative) = make_relative_path(path) else {
+            Log::err(format!(
+                "BlueprintEditor: path is outside registry: {}",
+                path.display()
+            ));
+            return;
+        };
+
+        match block_on(resource_manager.request::<BlueprintAsset>(relative)) {
+            Ok(resource) => {
+                let guard = resource.data_ref();
+                if let Some(asset) = guard.as_loaded_ref() {
+                    self.version = asset.version;
+
+                    match serde_json::from_str::<BlueprintGraph>(&asset.graph_json) {
+                        Ok(graph) => {
+                            self.graph = graph;
+                        }
+                        Err(err) => {
+                            Log::err(format!(
+                                "BlueprintEditor: invalid graph JSON in asset: {err}"
+                            ));
+                            self.graph = BlueprintGraph::new(
+                                fyrox_visual_scripting::GraphId("Blueprint".to_string()),
+                            );
+                        }
+                    }
+
+                    self.graph.ensure_builtin_graphs();
+
+                    if self.graph.nodes.is_empty() {
+                        self.seed_default_graph();
+                    }
+
+                    self.sync_variable_node_pin_types();
+
+                    self.rebuild_all_graph_views(ui);
+                    self.rebuild_graphs_panel(ui);
+                    self.rebuild_variables_panel(ui);
+                    self.rebuild_functions_panel(ui);
+                    self.set_selected_node(ui, None);
+                } else {
+                    Log::err("BlueprintEditor: blueprint asset is not loaded".to_string());
+                }
+            }
+            Err(err) => Log::err(format!("BlueprintEditor: failed to load asset: {err:?}")),
+        }
+    }
+
+    fn seed_default_graph(&mut self) {
+        let begin = {
+            let mut n = Node::new(BuiltinNodeKind::BeginPlay);
+            n.graph = tab_graph_name(BlueprintGraphTab::EventGraph).to_string();
+            n.position = [50.0, 50.0];
+            self.graph.add_node(n)
+        };
+
+        let print = {
+            let mut n = Node::new(BuiltinNodeKind::Print);
+            n.graph = tab_graph_name(BlueprintGraphTab::EventGraph).to_string();
+            n.position = [350.0, 50.0];
+            n.set_property_string("text", "Hello".to_string());
+            self.graph.add_node(n)
+        };
+
+        let then = self
+            .graph
+            .nodes
+            .get(&begin)
+            .and_then(|n| n.pin_named("then"))
+            .unwrap();
+        let exec = self
+            .graph
+            .nodes
+            .get(&print)
+            .and_then(|n| n.pin_named("exec"))
+            .unwrap();
+
+        self.graph.links.push(Link::exec(then, exec));
+    }
+
+    fn rebuild_all_graph_views(&mut self, ui: &mut UserInterface) {
+        let pin_owner = self.pin_owner_map();
+        let event_visible = self.visible_nodes(BlueprintGraphTab::EventGraph);
+        let construction_visible = self.visible_nodes(BlueprintGraphTab::ConstructionScript);
+
+        self.rebuild_graph_view_with_pin_owner(
+            ui,
+            BlueprintGraphTab::EventGraph,
+            &pin_owner,
+            &event_visible,
+        );
+        self.rebuild_graph_view_with_pin_owner(
+            ui,
+            BlueprintGraphTab::ConstructionScript,
+            &pin_owner,
+            &construction_visible,
+        );
+
+        for i in 0..self.extra_tabs.len() {
+            let name = self.extra_tabs[i].name.clone();
+            let visible = self.visible_nodes_by_graph_name(&name);
+            let view = &mut self.extra_tabs[i].view;
+            Self::rebuild_graph_view_for_view(ui, &self.graph, &pin_owner, view, &visible);
+        }
+    }
+
+    fn visible_nodes_by_graph_name(&self, name: &str) -> HashSet<NodeId> {
+        self.graph
+            .nodes
+            .iter()
+            .filter_map(|(id, n)| (n.graph == name).then_some(*id))
+            .collect()
+    }
+
+    fn rebuild_graph_view(
+        &mut self,
+        ui: &mut UserInterface,
+        tab: BlueprintGraphTab,
+        visible_nodes: &HashSet<NodeId>,
+    ) {
+        let pin_owner = self.pin_owner_map();
+        self.rebuild_graph_view_with_pin_owner(ui, tab, &pin_owner, visible_nodes);
+    }
+
+    fn rebuild_graph_view_with_pin_owner(
+        &mut self,
+        ui: &mut UserInterface,
+        tab: BlueprintGraphTab,
+        pin_owner: &HashMap<PinId, NodeId>,
+        visible_nodes: &HashSet<NodeId>,
+    ) {
+        let view = match tab {
+            BlueprintGraphTab::EventGraph => &mut self.event_view,
+            BlueprintGraphTab::ConstructionScript => &mut self.construction_view,
+        };
+
+        Self::rebuild_graph_view_for_view(ui, &self.graph, pin_owner, view, visible_nodes);
+    }
+
+    fn rebuild_graph_view_for_view(
+        ui: &mut UserInterface,
+        graph: &BlueprintGraph,
+        pin_owner: &HashMap<PinId, NodeId>,
+        view: &mut GraphView,
+        visible_nodes: &HashSet<NodeId>,
+    ) {
+        view.clear_ui(ui);
+
+        // Create node views.
+        for (node_id, node) in graph.nodes.iter() {
+            if !visible_nodes.contains(node_id) {
+                continue;
+            }
+
+            let model_handle = view.models.spawn(BlueprintNodeModel {
+                node_id: node_id.0,
+            });
+
+            let mut input_sockets = Vec::new();
+            let mut output_sockets = Vec::new();
+
+            let mut pins = node.pins.iter().collect::<Vec<_>>();
+            pins.sort_by_key(|p| {
+                let exec_first = if p.data_type == DataType::Exec { 0 } else { 1 };
+                let dir_group = match p.direction {
+                    PinDirection::Input => 0,
+                    PinDirection::Output => 1,
+                };
+                (dir_group, exec_first, p.name.as_str())
+            });
+
+            for pin in pins {
+                // Unreal-like pin colors based on data type.
+                let pin_color = match pin.data_type {
+                    DataType::Exec => fyrox::core::color::Color::WHITE,
+                    DataType::Bool => fyrox::core::color::Color::opaque(200, 70, 70),
+                    DataType::I32 => fyrox::core::color::Color::opaque(60, 200, 220),
+                    DataType::F32 => fyrox::core::color::Color::opaque(90, 200, 90),
+                    DataType::String => fyrox::core::color::Color::opaque(240, 80, 200),
+                    DataType::Unit => fyrox::core::color::Color::opaque(140, 140, 140),
+                };
+
+                let label = TextBuilder::new(
+                    WidgetBuilder::new()
+                        .with_margin(Thickness::left(4.0))
+                        .with_height(16.0),
+                )
+                .with_text(pin.name.clone())
+                .build(&mut ui.build_ctx());
+
+                let socket = SocketBuilder::new(WidgetBuilder::new().with_margin(Thickness::uniform(2.0)))
+                .with_direction(match pin.direction {
+                    fyrox_visual_scripting::PinDirection::Input => SocketDirection::Input,
+                    fyrox_visual_scripting::PinDirection::Output => SocketDirection::Output,
+                })
+                .with_parent_node(ErasedHandle::from(model_handle))
+                .with_editor(label)
+                .with_index(pin.id.0 as usize)
+                .with_show_index(false)
+                .with_pin_color(pin_color)
+                .build(&mut ui.build_ctx());
+
+                view.pin_to_socket.insert(pin.id, socket);
+                view.socket_to_pin.insert(socket, pin.id);
+                view.pin_to_node.insert(pin.id, *node_id);
+
+                match pin.direction {
+                    PinDirection::Input => input_sockets.push(socket),
+                    PinDirection::Output => output_sockets.push(socket),
+                }
+            }
+
+            let display_name = match node.kind {
+                BuiltinNodeKind::BeginPlay => "BeginPlay",
+                BuiltinNodeKind::Tick => "Tick",
+                BuiltinNodeKind::ConstructionScript => "Construction Script",
+                BuiltinNodeKind::Print => "Print",
+                BuiltinNodeKind::Branch => "Branch",
+                BuiltinNodeKind::GetVariable => "GetVariable",
+                BuiltinNodeKind::SetVariable => "SetVariable",
+            }
+            .to_string();
+
+            // Unreal-like header colors based on node type.
+            let header_color = match node.kind {
+                BuiltinNodeKind::BeginPlay | BuiltinNodeKind::Tick => {
+                    // Event nodes = red
+                    fyrox::core::color::Color::opaque(180, 40, 40)
+                }
+                BuiltinNodeKind::ConstructionScript => {
+                    // Construction = dark blue
+                    fyrox::core::color::Color::opaque(30, 80, 160)
+                }
+                BuiltinNodeKind::Print => {
+                    // Utility/debug = cyan
+                    fyrox::core::color::Color::opaque(40, 140, 160)
+                }
+                BuiltinNodeKind::Branch => {
+                    // Flow control = gray
+                    fyrox::core::color::Color::opaque(90, 90, 90)
+                }
+                BuiltinNodeKind::GetVariable | BuiltinNodeKind::SetVariable => {
+                    // Variable nodes = green
+                    fyrox::core::color::Color::opaque(40, 140, 60)
+                }
+            };
+
+            let selected_header_color = fyrox::core::color::Color::opaque(
+                header_color.r.saturating_add(50),
+                header_color.g.saturating_add(50),
+                header_color.b.saturating_add(50),
+            );
+
+            let mut content = Handle::NONE;
+            let mut content_key: Option<&'static str> = None;
+
+            if node.kind == BuiltinNodeKind::Print {
+                content_key = Some("text");
+            } else if matches!(node.kind, BuiltinNodeKind::GetVariable | BuiltinNodeKind::SetVariable) {
+                content_key = Some("name");
+            }
+
+            if let Some(key) = content_key {
+                let initial = node
+                    .properties
+                    .get(key)
+                    .and_then(|v| match v {
+                        Value::String(s) => Some(s.as_str()),
+                        _ => None,
+                    })
+                    .unwrap_or("");
+
+                content = TextBoxBuilder::new(
+                    WidgetBuilder::new()
+                        .with_margin(Thickness::uniform(2.0))
+                        .with_width(180.0)
+                        .with_height(24.0),
+                )
+                .with_text(initial)
+                .build(&mut ui.build_ctx());
+
+                view.node_primary_text_box_by_node.insert(*node_id, content);
+                view.node_text_box_binding
+                    .insert(content, (*node_id, key.to_string()));
+            }
+
+            let node_view = {
+                let mut builder = AbsmNodeBuilder::new(
+                    WidgetBuilder::new().with_desired_position(
+                        fyrox::core::algebra::Vector2::new(node.position[0], node.position[1]),
+                    ),
+                )
+                .with_model_handle(model_handle)
+                .with_name(display_name)
+                .with_show_model_handle(false)
+                .with_layout(AbsmNodeLayout::BlueprintCompact)
+                .with_normal_brush(fyrox::gui::brush::Brush::Solid(header_color).into())
+                .with_selected_brush(fyrox::gui::brush::Brush::Solid(selected_header_color).into())
+                .with_input_sockets(input_sockets)
+                .with_output_sockets(output_sockets);
+
+                if content != Handle::NONE {
+                    builder = builder.with_content(content);
+                }
+
+                builder.build(&mut ui.build_ctx())
+            };
+
+            ui.send_sync(node_view, WidgetMessage::LinkWith(view.canvas));
+            view.node_views.insert(*node_id, node_view);
+            view.view_to_node.insert(node_view, *node_id);
+            view.node_view_handles.push(node_view);
+        }
+
+        for link in graph.links.iter() {
+            let Some(src_node) = pin_owner.get(&link.from).copied() else {
+                continue;
+            };
+            let Some(dst_node) = pin_owner.get(&link.to).copied() else {
+                continue;
+            };
+            if !visible_nodes.contains(&src_node) || !visible_nodes.contains(&dst_node) {
+                continue;
+            }
+            let data_type = graph
+                .pin(link.from)
+                .map(|p| p.data_type)
+                .or_else(|| graph.pin(link.to).map(|p| p.data_type))
+                .unwrap_or(DataType::Unit);
+
+            let is_exec = data_type == DataType::Exec;
+
+            spawn_connection_view(ui, view, link.from, link.to, data_type, is_exec);
+        }
+    }
+
+    fn pin_owner_map(&self) -> HashMap<PinId, NodeId> {
+        let mut map = HashMap::new();
+        for (node_id, node) in self.graph.nodes.iter() {
+            for pin in node.pins.iter() {
+                map.insert(pin.id, *node_id);
+            }
+        }
+        map
+    }
+
+    fn visible_nodes(&self, tab: BlueprintGraphTab) -> HashSet<NodeId> {
+        let name = tab_graph_name(tab);
+        self.visible_nodes_by_graph_name(name)
+    }
+
+    fn rebuild_graphs_panel(&mut self, ui: &mut UserInterface) {
+        for w in self.my_blueprint_graph_widgets.drain(..) {
+            ui.send(w, WidgetMessage::Remove);
+        }
+        self.my_blueprint_graph_select.clear();
+
+        let any = self
+            .graph
+            .graphs
+            .iter()
+            .enumerate()
+            .any(|(_, g)| g.kind == GraphKind::Graph);
+
+        if !any {
+            let t = TextBuilder::new(WidgetBuilder::new().with_margin(Thickness::uniform(2.0)))
+                .with_text("(MVP) No graphs")
+                .build(&mut ui.build_ctx());
+            ui.send(t, WidgetMessage::LinkWith(self.my_blueprint_graphs_panel));
+            self.my_blueprint_graph_widgets.push(t);
+            return;
+        }
+
+        for (index, g) in self.graph.graphs.iter().enumerate() {
+            if g.kind != GraphKind::Graph {
+                continue;
+            }
+
+            let b = ButtonBuilder::new(WidgetBuilder::new().with_height(24.0))
+                .with_text(&g.name)
+                .build(&mut ui.build_ctx());
+            self.my_blueprint_graph_select.insert(b, index);
+            ui.send(b, WidgetMessage::LinkWith(self.my_blueprint_graphs_panel));
+            self.my_blueprint_graph_widgets.push(b);
+        }
+    }
+
+    fn rebuild_functions_panel(&mut self, ui: &mut UserInterface) {
+        for w in self.my_blueprint_function_widgets.drain(..) {
+            ui.send(w, WidgetMessage::Remove);
+        }
+        self.my_blueprint_function_select.clear();
+
+        let any = self
+            .graph
+            .graphs
+            .iter()
+            .enumerate()
+            .any(|(_, g)| g.kind == GraphKind::Function);
+
+        if !any {
+            let t = TextBuilder::new(WidgetBuilder::new().with_margin(Thickness::uniform(2.0)))
+                .with_text("(MVP) No functions")
+                .build(&mut ui.build_ctx());
+            ui.send(t, WidgetMessage::LinkWith(self.my_blueprint_functions_panel));
+            self.my_blueprint_function_widgets.push(t);
+            return;
+        }
+
+        for (index, g) in self.graph.graphs.iter().enumerate() {
+            if g.kind != GraphKind::Function {
+                continue;
+            }
+
+            let b = ButtonBuilder::new(WidgetBuilder::new().with_height(24.0))
+                .with_text(&g.name)
+                .build(&mut ui.build_ctx());
+            self.my_blueprint_function_select.insert(b, index);
+            ui.send(b, WidgetMessage::LinkWith(self.my_blueprint_functions_panel));
+            self.my_blueprint_function_widgets.push(b);
+        }
+    }
+
+    fn open_graph_tab(&mut self, ui: &mut UserInterface, name: &str, kind: GraphKind) {
+        match kind {
+            GraphKind::Event => {
+                self.active_extra_tab = None;
+                self.active_tab = BlueprintGraphTab::EventGraph;
+                ui.send(self.tab_control, TabControlMessage::ActiveTab(Some(0)));
+                return;
+            }
+            GraphKind::Construction => {
+                self.active_extra_tab = None;
+                self.active_tab = BlueprintGraphTab::ConstructionScript;
+                ui.send(self.tab_control, TabControlMessage::ActiveTab(Some(1)));
+                return;
+            }
+            _ => {}
+        }
+
+        if let Some(i) = self.extra_tabs.iter().position(|t| t.name == name) {
+            self.active_extra_tab = Some(i);
+            ui.send(self.tab_control, TabControlMessage::ActiveTab(Some(2 + i)));
+            return;
+        }
+
+        let canvas = AbsmCanvasBuilder::new(WidgetBuilder::new()).build(&mut ui.build_ctx());
+        let uuid = Uuid::new_v4();
+        let definition = {
+            let ctx = &mut ui.build_ctx();
+            make_tab(name, canvas, ctx)
+        };
+        ui.send(
+            self.tab_control,
+            TabControlMessage::AddTab { uuid, definition },
+        );
+
+        let mut view = GraphView::new(canvas);
+        let visible = self.visible_nodes_by_graph_name(name);
+        let pin_owner = self.pin_owner_map();
+        Self::rebuild_graph_view_for_view(ui, &self.graph, &pin_owner, &mut view, &visible);
+
+        self.extra_tabs.push(ExtraTab {
+            uuid,
+            name: name.to_string(),
+            kind,
+            view,
+        });
+        self.active_extra_tab = Some(self.extra_tabs.len().saturating_sub(1));
+    }
+
+    fn set_selected_node(&mut self, ui: &mut UserInterface, node_id: Option<NodeId>) {
+        self.selected_node = node_id;
+        self.selected_variable = None;
+        self.rebuild_details(ui);
+    }
+
+    fn set_selected_variable(&mut self, ui: &mut UserInterface, index: Option<usize>) {
+        self.selected_variable = index;
+        self.selected_node = None;
+        self.rebuild_details(ui);
+    }
+
+    fn rebuild_details(&mut self, ui: &mut UserInterface) {
+        for w in self.details_widgets.drain(..) {
+            ui.send(w, WidgetMessage::Remove);
+        }
+        self.details_bindings.clear();
+
+        let header_text = if let Some(node_id) = self.selected_node {
+            self.graph
+                .nodes
+                .get(&node_id)
+                .map(|n| format!("Selected: {:?}", n.kind))
+                .unwrap_or_else(|| "Selected".to_string())
+        } else if let Some(var_index) = self.selected_variable {
+            self.graph
+                .variables
+                .get(var_index)
+                .map(|v| format!("Variable: {}", v.name))
+                .unwrap_or_else(|| "Variable".to_string())
+        } else {
+            "Select a node or variable to edit details".to_string()
+        };
+
+        let header = TextBuilder::new(WidgetBuilder::new().with_margin(Thickness::uniform(2.0)))
+            .with_text(header_text)
+            .build(&mut ui.build_ctx());
+        ui.send(header, WidgetMessage::LinkWith(self.details_panel));
+        self.details_widgets.push(header);
+
+        if let Some(var_index) = self.selected_variable {
+            let Some(var) = self.graph.variables.get(var_index) else {
+                return;
+            };
+
+            let label = TextBuilder::new(WidgetBuilder::new().with_margin(Thickness::uniform(2.0)))
+                .with_text("Name")
+                .build(&mut ui.build_ctx());
+            ui.send(label, WidgetMessage::LinkWith(self.details_panel));
+            self.details_widgets.push(label);
+
+            let tb = TextBoxBuilder::new(
+                WidgetBuilder::new()
+                    .with_margin(Thickness::uniform(2.0))
+                    .with_height(24.0),
+            )
+            .with_text(var.name.clone())
+            .build(&mut ui.build_ctx());
+            ui.send(tb, WidgetMessage::LinkWith(self.details_panel));
+            self.details_widgets.push(tb);
+            self.details_bindings
+                .insert(tb, DetailsBinding::VariableName { index: var_index });
+
+            let label = TextBuilder::new(WidgetBuilder::new().with_margin(Thickness::uniform(2.0)))
+                .with_text("Type")
+                .build(&mut ui.build_ctx());
+            ui.send(label, WidgetMessage::LinkWith(self.details_panel));
+            self.details_widgets.push(label);
+
+            let items = vec![
+                make_dropdown_list_option(&mut ui.build_ctx(), "Bool"),
+                make_dropdown_list_option(&mut ui.build_ctx(), "I32"),
+                make_dropdown_list_option(&mut ui.build_ctx(), "F32"),
+                make_dropdown_list_option(&mut ui.build_ctx(), "String"),
+            ];
+
+            let selected = match var.data_type {
+                DataType::Bool => 0,
+                DataType::I32 => 1,
+                DataType::F32 => 2,
+                _ => 3,
+            };
+
+            let dd = DropdownListBuilder::new(
+                WidgetBuilder::new()
+                    .with_margin(Thickness::uniform(2.0))
+                    .with_height(24.0),
+            )
+            .with_items(items)
+            .with_selected(selected)
+            .build(&mut ui.build_ctx());
+
+            ui.send(dd, WidgetMessage::LinkWith(self.details_panel));
+            self.details_widgets.push(dd);
+            self.details_bindings
+                .insert(dd, DetailsBinding::VariableType { index: var_index });
+            return;
+        }
+
+        let Some(node_id) = self.selected_node else {
+            return;
+        };
+        let Some(node) = self.graph.nodes.get(&node_id) else {
+            return;
+        };
+
+        match node.kind {
+            BuiltinNodeKind::Print => {
+                let label = TextBuilder::new(
+                    WidgetBuilder::new().with_margin(Thickness::uniform(2.0)),
+                )
+                .with_text("Text")
+                .build(&mut ui.build_ctx());
+                ui.send(label, WidgetMessage::LinkWith(self.details_panel));
+                self.details_widgets.push(label);
+
+                let initial = node
+                    .properties
+                    .get("text")
+                    .and_then(|v| match v {
+                        Value::String(s) => Some(s.as_str()),
+                        _ => None,
+                    })
+                    .unwrap_or("");
+
+                let tb = TextBoxBuilder::new(
+                    WidgetBuilder::new()
+                        .with_margin(Thickness::uniform(2.0))
+                        .with_height(24.0),
+                )
+                .with_text(initial)
+                .build(&mut ui.build_ctx());
+                ui.send(tb, WidgetMessage::LinkWith(self.details_panel));
+                self.details_widgets.push(tb);
+                self.details_bindings
+                    .insert(tb, DetailsBinding::NodeProp { node: node_id, key: "text" });
+            }
+            BuiltinNodeKind::GetVariable => {
+                let label = TextBuilder::new(
+                    WidgetBuilder::new().with_margin(Thickness::uniform(2.0)),
+                )
+                .with_text("Variable")
+                .build(&mut ui.build_ctx());
+                ui.send(label, WidgetMessage::LinkWith(self.details_panel));
+                self.details_widgets.push(label);
+
+                let initial = node
+                    .properties
+                    .get("name")
+                    .and_then(|v| match v {
+                        Value::String(s) => Some(s.as_str()),
+                        _ => None,
+                    })
+                    .unwrap_or("");
+
+                let tb = TextBoxBuilder::new(
+                    WidgetBuilder::new()
+                        .with_margin(Thickness::uniform(2.0))
+                        .with_height(24.0),
+                )
+                .with_text(initial)
+                .build(&mut ui.build_ctx());
+                ui.send(tb, WidgetMessage::LinkWith(self.details_panel));
+                self.details_widgets.push(tb);
+                self.details_bindings
+                    .insert(tb, DetailsBinding::NodeProp { node: node_id, key: "name" });
+            }
+            BuiltinNodeKind::SetVariable => {
+                let label = TextBuilder::new(
+                    WidgetBuilder::new().with_margin(Thickness::uniform(2.0)),
+                )
+                .with_text("Variable")
+                .build(&mut ui.build_ctx());
+                ui.send(label, WidgetMessage::LinkWith(self.details_panel));
+                self.details_widgets.push(label);
+
+                let initial = node
+                    .properties
+                    .get("name")
+                    .and_then(|v| match v {
+                        Value::String(s) => Some(s.as_str()),
+                        _ => None,
+                    })
+                    .unwrap_or("");
+
+                let tb = TextBoxBuilder::new(
+                    WidgetBuilder::new()
+                        .with_margin(Thickness::uniform(2.0))
+                        .with_height(24.0),
+                )
+                .with_text(initial)
+                .build(&mut ui.build_ctx());
+                ui.send(tb, WidgetMessage::LinkWith(self.details_panel));
+                self.details_widgets.push(tb);
+                self.details_bindings
+                    .insert(tb, DetailsBinding::NodeProp { node: node_id, key: "name" });
+
+                let var_dt = node
+                    .properties
+                    .get("name")
+                    .and_then(|v| match v {
+                        Value::String(s) => Some(s.as_str()),
+                        _ => None,
+                    })
+                    .and_then(|n| self.graph.variables.iter().find(|v| v.name == n))
+                    .map(|v| v.data_type);
+
+                if matches!(var_dt, Some(DataType::String) | None) {
+                    let label = TextBuilder::new(
+                        WidgetBuilder::new().with_margin(Thickness::uniform(2.0)),
+                    )
+                    .with_text("Value")
+                    .build(&mut ui.build_ctx());
+                    ui.send(label, WidgetMessage::LinkWith(self.details_panel));
+                    self.details_widgets.push(label);
+
+                    let initial = node
+                        .properties
+                        .get("value")
+                        .and_then(|v| match v {
+                            Value::String(s) => Some(s.as_str()),
+                            _ => None,
+                        })
+                        .unwrap_or("");
+
+                    let tb = TextBoxBuilder::new(
+                        WidgetBuilder::new()
+                            .with_margin(Thickness::uniform(2.0))
+                            .with_height(24.0),
+                    )
+                    .with_text(initial)
+                    .build(&mut ui.build_ctx());
+                    ui.send(tb, WidgetMessage::LinkWith(self.details_panel));
+                    self.details_widgets.push(tb);
+                    self.details_bindings
+                        .insert(tb, DetailsBinding::NodeProp { node: node_id, key: "value" });
+                } else {
+                    let hint = TextBuilder::new(
+                        WidgetBuilder::new().with_margin(Thickness::uniform(2.0)),
+                    )
+                    .with_text("(MVP) Wire a value into 'value' pin")
+                    .build(&mut ui.build_ctx());
+                    ui.send(hint, WidgetMessage::LinkWith(self.details_panel));
+                    self.details_widgets.push(hint);
+                }
+            }
+            _ => {
+                let hint = TextBuilder::new(
+                    WidgetBuilder::new().with_margin(Thickness::uniform(2.0)),
+                )
+                .with_text("(MVP) No editable properties")
+                .build(&mut ui.build_ctx());
+                ui.send(hint, WidgetMessage::LinkWith(self.details_panel));
+                self.details_widgets.push(hint);
+            }
+        }
+    }
+
+    fn rebuild_variables_panel(&mut self, ui: &mut UserInterface) {
+        for w in self.my_blueprint_variable_widgets.drain(..) {
+            ui.send(w, WidgetMessage::Remove);
+        }
+        self.my_blueprint_variable_select.clear();
+        self.my_blueprint_variable_get.clear();
+        self.my_blueprint_variable_set.clear();
+
+        if self.graph.variables.is_empty() {
+            let t = TextBuilder::new(WidgetBuilder::new().with_margin(Thickness::uniform(2.0)))
+                .with_text("(MVP) No variables")
+                .build(&mut ui.build_ctx());
+            ui.send(t, WidgetMessage::LinkWith(self.my_blueprint_variables_panel));
+            self.my_blueprint_variable_widgets.push(t);
+            return;
+        }
+
+        for (index, var) in self.graph.variables.iter().enumerate() {
+            let select = {
+                let label = format!("{} : {}", var.name, data_type_label(var.data_type));
+                let b = ButtonBuilder::new(
+                    WidgetBuilder::new().with_height(24.0).with_width(140.0),
+                )
+                .with_text(&label)
+                .build(&mut ui.build_ctx());
+                self.my_blueprint_variable_select.insert(b, index);
+                b
+            };
+
+            let get_btn = {
+                let b = ButtonBuilder::new(
+                    WidgetBuilder::new().with_height(24.0).with_width(48.0),
+                )
+                .with_text("Get")
+                .build(&mut ui.build_ctx());
+                self.my_blueprint_variable_get.insert(b, index);
+                b
+            };
+
+            let set_btn = {
+                let b = ButtonBuilder::new(
+                    WidgetBuilder::new().with_height(24.0).with_width(48.0),
+                )
+                .with_text("Set")
+                .build(&mut ui.build_ctx());
+                self.my_blueprint_variable_set.insert(b, index);
+                b
+            };
+
+            let row = StackPanelBuilder::new(
+                WidgetBuilder::new()
+                    .with_margin(Thickness::uniform(1.0))
+                    .with_child(select)
+                    .with_child(get_btn)
+                    .with_child(set_btn),
+            )
+            .with_orientation(Orientation::Horizontal)
+            .build(&mut ui.build_ctx());
+
+            ui.send(row, WidgetMessage::LinkWith(self.my_blueprint_variables_panel));
+            self.my_blueprint_variable_widgets.push(row);
+        }
+    }
+
+    fn create_variable(&mut self, ui: &mut UserInterface) {
+        let base = "NewVar";
+        let mut name = base.to_string();
+        let mut i = 1;
+        while self.graph.variables.iter().any(|v| v.name == name) {
+            name = format!("{base}{i}");
+            i += 1;
+        }
+
+        self.graph.variables.push(VariableDef {
+            name: name.clone(),
+            data_type: fyrox_visual_scripting::DataType::String,
+            default_value: Some(Value::String(String::new())),
+        });
+
+        self.rebuild_variables_panel(ui);
+        self.set_selected_variable(ui, Some(self.graph.variables.len().saturating_sub(1)));
+    }
+
+    fn spawn_get_variable(&mut self, ui: &mut UserInterface, var_index: usize) {
+        let Some(var) = self.graph.variables.get(var_index) else {
+            return;
+        };
+
+        let mut n = Node::new(BuiltinNodeKind::GetVariable);
+        n.graph = self.active_graph_name().to_string();
+        n.position = [60.0, 200.0 + (var_index as f32) * 60.0];
+        n.set_property_string("name", var.name.clone());
+        set_pin_data_type_by_name(&mut n, "value", var.data_type);
+        let node_id = self.graph.add_node(n);
+
+        self.rebuild_all_graph_views(ui);
+        self.set_selected_node(ui, Some(node_id));
+    }
+
+    fn spawn_set_variable(&mut self, ui: &mut UserInterface, var_index: usize) {
+        let Some(var) = self.graph.variables.get(var_index) else {
+            return;
+        };
+
+        let mut n = Node::new(BuiltinNodeKind::SetVariable);
+        n.graph = self.active_graph_name().to_string();
+        n.position = [60.0, 240.0 + (var_index as f32) * 60.0];
+        n.set_property_string("name", var.name.clone());
+        match var.data_type {
+            DataType::Bool => n.set_property_bool("value", false),
+            DataType::I32 => n.set_property_i32("value", 0),
+            DataType::F32 => n.set_property_f32("value", 0.0),
+            _ => n.set_property_string("value", String::new()),
+        }
+        set_pin_data_type_by_name(&mut n, "value", var.data_type);
+        let node_id = self.graph.add_node(n);
+
+        self.rebuild_all_graph_views(ui);
+        self.set_selected_node(ui, Some(node_id));
+    }
+
+    fn sync_variable_node_pin_types(&mut self) {
+        let vars_by_name: HashMap<&str, DataType> = self
+            .graph
+            .variables
+            .iter()
+            .map(|v| (v.name.as_str(), v.data_type))
+            .collect();
+
+        for node in self.graph.nodes.values_mut() {
+            match node.kind {
+                BuiltinNodeKind::GetVariable | BuiltinNodeKind::SetVariable => {
+                    let Some(Value::String(var_name)) = node.properties.get("name") else {
+                        continue;
+                    };
+                    let Some(dt) = vars_by_name.get(var_name.as_str()).copied() else {
+                        continue;
+                    };
+                    set_pin_data_type_by_name(node, "value", dt);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn save_to_disk(&mut self, engine: &mut Engine) {
+        let Some(path) = self.path.as_ref() else {
+            return;
+        };
+
+        if let Err(err) = compile(&self.graph) {
+            Log::err(format!("BlueprintEditor: compile error: {err}"));
+            return;
+        }
+
+        let graph_json = match serde_json::to_string_pretty(&self.graph) {
+            Ok(s) => s,
+            Err(err) => {
+                Log::err(format!("BlueprintEditor: failed to serialize graph: {err}"));
+                return;
+            }
+        };
+
+        let mut asset = BlueprintAsset {
+            version: self.version,
+            graph_json,
+        };
+
+        if let Err(err) = asset.save(path) {
+            Log::err(format!("BlueprintEditor: save failed: {err:?}"));
+            return;
+        }
+
+        if let Ok(relative) = make_relative_path(path) {
+            if let Ok(resource) = block_on(engine.resource_manager.request_untyped(&relative)) {
+                engine.resource_manager.state().reload_resource(resource);
+            }
+        }
+
+        Log::info(format!("Saved blueprint: {}", path.display()));
+    }
+
+    fn handle_ui_message(&mut self, message: &UiMessage, engine: &mut Engine) {
+        if let Some(ButtonMessage::Click) = message.data() {
+            if message.destination() == self.save {
+                self.save_to_disk(engine);
+            }
+
+            if message.destination() == self.my_blueprint_new_graph {
+                let ui = engine.user_interfaces.first_mut();
+                let base = "NewGraph";
+                let mut name = base.to_string();
+                let mut i = 1;
+                while self.graph.graphs.iter().any(|g| g.name == name) {
+                    name = format!("{base}{i}");
+                    i += 1;
+                }
+                self.graph.add_graph(name.clone(), GraphKind::Graph);
+                self.rebuild_graphs_panel(ui);
+                self.open_graph_tab(ui, &name, GraphKind::Graph);
+            }
+
+            if message.destination() == self.my_blueprint_new_variable {
+                let ui = engine.user_interfaces.first_mut();
+                self.create_variable(ui);
+            }
+
+            if message.destination() == self.my_blueprint_new_function {
+                let ui = engine.user_interfaces.first_mut();
+                let base = "NewFunction";
+                let mut name = base.to_string();
+                let mut i = 1;
+                while self.graph.graphs.iter().any(|g| g.name == name) {
+                    name = format!("{base}{i}");
+                    i += 1;
+                }
+                self.graph.add_graph(name.clone(), GraphKind::Function);
+                self.rebuild_functions_panel(ui);
+                self.open_graph_tab(ui, &name, GraphKind::Function);
+            }
+
+            if message.destination() == self.my_blueprint_graphs_event {
+                self.active_extra_tab = None;
+                self.active_tab = BlueprintGraphTab::EventGraph;
+                engine
+                    .user_interfaces
+                    .first_mut()
+                    .send(self.tab_control, TabControlMessage::ActiveTab(Some(0)));
+            }
+
+            if message.destination() == self.my_blueprint_graphs_construction {
+                self.active_extra_tab = None;
+                self.active_tab = BlueprintGraphTab::ConstructionScript;
+                engine
+                    .user_interfaces
+                    .first_mut()
+                    .send(self.tab_control, TabControlMessage::ActiveTab(Some(1)));
+            }
+
+            if let Some(&graph_index) = self.my_blueprint_graph_select.get(&message.destination()) {
+                let ui = engine.user_interfaces.first_mut();
+                if let Some(g) = self.graph.graphs.get(graph_index) {
+                    let name = g.name.clone();
+                    let kind = g.kind;
+                    self.open_graph_tab(ui, &name, kind);
+                }
+            }
+
+            if let Some(&graph_index) =
+                self.my_blueprint_function_select.get(&message.destination())
+            {
+                let ui = engine.user_interfaces.first_mut();
+                if let Some(g) = self.graph.graphs.get(graph_index) {
+                    let name = g.name.clone();
+                    let kind = g.kind;
+                    self.open_graph_tab(ui, &name, kind);
+                }
+            }
+
+            if let Some(&index) = self.my_blueprint_variable_select.get(&message.destination()) {
+                let ui = engine.user_interfaces.first_mut();
+                self.set_selected_variable(ui, Some(index));
+            }
+
+            if let Some(&index) = self.my_blueprint_variable_get.get(&message.destination()) {
+                let ui = engine.user_interfaces.first_mut();
+                self.spawn_get_variable(ui, index);
+            }
+
+            if let Some(&index) = self.my_blueprint_variable_set.get(&message.destination()) {
+                let ui = engine.user_interfaces.first_mut();
+                self.spawn_set_variable(ui, index);
+            }
+            return;
+        }
+
+        if let Some(TabControlMessage::ActiveTab(Some(index))) = message.data() {
+            if message.destination() == self.tab_control {
+                if *index == 0 {
+                    self.active_extra_tab = None;
+                    self.active_tab = BlueprintGraphTab::EventGraph;
+                } else if *index == 1 {
+                    self.active_extra_tab = None;
+                    self.active_tab = BlueprintGraphTab::ConstructionScript;
+                } else {
+                    let extra_index = index.saturating_sub(2);
+                    if extra_index < self.extra_tabs.len() {
+                        self.active_extra_tab = Some(extra_index);
+                    } else {
+                        self.active_extra_tab = None;
+                    }
+                }
+            }
+        }
+
+        // Route graph edits/selection from both views (including embedded widgets).
+        let ui = engine.user_interfaces.first_mut();
+        self.handle_canvas_message(message, ui, BlueprintGraphTab::EventGraph);
+        self.handle_canvas_message(message, ui, BlueprintGraphTab::ConstructionScript);
+        for i in 0..self.extra_tabs.len() {
+            if self.handle_extra_canvas_message(message, ui, i) {
+                return;
+            }
+        }
+
+        // Details panel edits.
+        if let Some(TextMessage::Text(text)) = message.data::<TextMessage>() {
+            if let Some(binding) = self.details_bindings.get(&message.destination()).copied() {
+                let ui = engine.user_interfaces.first_mut();
+                match binding {
+                    DetailsBinding::NodeProp { node, key } => {
+                        if let Some(n) = self.graph.nodes.get_mut(&node) {
+                            n.properties
+                                .insert(key.to_string(), Value::String(text.clone()));
+                        }
+
+                        if let Some(tb) = self
+                            .event_view
+                            .node_primary_text_box_by_node
+                            .get(&node)
+                            .copied()
+                        {
+                            ui.send(tb, TextMessage::Text(text.clone()));
+                        }
+                        if let Some(tb) = self
+                            .construction_view
+                            .node_primary_text_box_by_node
+                            .get(&node)
+                            .copied()
+                        {
+                            ui.send(tb, TextMessage::Text(text.clone()));
+                        }
+
+                        for tab in self.extra_tabs.iter() {
+                            if let Some(tb) =
+                                tab.view.node_primary_text_box_by_node.get(&node).copied()
+                            {
+                                ui.send(tb, TextMessage::Text(text.clone()));
+                            }
+                        }
+                    }
+                    DetailsBinding::VariableName { index } => {
+                        let Some(var) = self.graph.variables.get_mut(index) else {
+                            return;
+                        };
+                        let old = var.name.clone();
+                        var.name = text.clone();
+
+                        for n in self.graph.nodes.values_mut() {
+                            if matches!(
+                                n.kind,
+                                BuiltinNodeKind::GetVariable | BuiltinNodeKind::SetVariable
+                            ) {
+                                if let Some(Value::String(name)) = n.properties.get_mut("name") {
+                                    if *name == old {
+                                        *name = text.clone();
+                                    }
+                                }
+                            }
+                        }
+
+                        self.rebuild_variables_panel(ui);
+                        self.rebuild_all_graph_views(ui);
+                        self.rebuild_details(ui);
+                    }
+                    DetailsBinding::VariableType { .. } => {}
+                }
+            }
+        }
+
+        if let Some(DropdownListMessage::Selection(Some(selection))) = message.data() {
+            if let Some(binding) = self.details_bindings.get(&message.destination()).copied() {
+                if let DetailsBinding::VariableType { index } = binding {
+                    let Some(var) = self.graph.variables.get_mut(index) else {
+                        return;
+                    };
+
+                    var.data_type = match *selection {
+                        0 => DataType::Bool,
+                        1 => DataType::I32,
+                        2 => DataType::F32,
+                        _ => DataType::String,
+                    };
+
+                    var.default_value = Some(match var.data_type {
+                        DataType::Bool => Value::Bool(false),
+                        DataType::I32 => Value::I32(0),
+                        DataType::F32 => Value::F32(0.0),
+                        DataType::String => Value::String(String::new()),
+                        _ => Value::Unit,
+                    });
+
+                    self.sync_variable_node_pin_types();
+
+                    let ui = engine.user_interfaces.first_mut();
+                    self.rebuild_all_graph_views(ui);
+                    self.rebuild_details(ui);
+                }
+            }
+        }
+    }
+
+    fn handle_canvas_message(
+        &mut self,
+        message: &UiMessage,
+        ui: &mut UserInterface,
+        tab: BlueprintGraphTab,
+    ) {
+        let view = match tab {
+            BlueprintGraphTab::EventGraph => &mut self.event_view,
+            BlueprintGraphTab::ConstructionScript => &mut self.construction_view,
+        };
+
+        if let Some(AbsmCanvasMessage::SelectionChanged(selection)) = message.data_from(view.canvas)
+        {
+            let selected = selection
+                .iter()
+                .find_map(|h| view.view_to_node.get(h).copied());
+            self.set_selected_node(ui, selected);
+            return;
+        }
+
+        if let Some(AbsmCanvasMessage::CommitDrag { .. }) = message.data_from(view.canvas) {
+            for (node_id, node_view) in view.node_views.iter() {
+                let pos = ui.node(*node_view).desired_local_position();
+                if let Some(node) = self.graph.nodes.get_mut(node_id) {
+                    node.position = [pos.x, pos.y];
+                }
+            }
+            return;
+        }
+
+        if let Some(AbsmCanvasMessage::CommitConnection {
+            source_socket,
+            dest_socket,
+        }) = message.data_from(view.canvas)
+        {
+            let (Some(a), Some(b)) = (
+                view.socket_to_pin.get(source_socket).copied(),
+                view.socket_to_pin.get(dest_socket).copied(),
+            ) else {
+                Log::warn(
+                    "BlueprintEditor: CommitConnection rejected: unknown socket->pin mapping"
+                        .to_string(),
+                );
+                return;
+            };
+
+            let a_dir = ui_node_socket_dir(ui, *source_socket);
+            let b_dir = ui_node_socket_dir(ui, *dest_socket);
+
+            let (from, to) = match (a_dir, b_dir) {
+                (Some(SocketDirection::Output), Some(SocketDirection::Input)) => (a, b),
+                (Some(SocketDirection::Input), Some(SocketDirection::Output)) => (b, a),
+                _ => {
+                    Log::warn(format!(
+                        "BlueprintEditor: CommitConnection rejected: socket directions {:?} -> {:?}",
+                        a_dir, b_dir
+                    ));
+                    return;
+                }
+            };
+
+            let (Some(from_pin), Some(to_pin)) = (self.graph.pin(from), self.graph.pin(to)) else {
+                Log::warn("BlueprintEditor: CommitConnection rejected: missing pins".to_string());
+                return;
+            };
+
+            if from_pin.direction != PinDirection::Output
+                || to_pin.direction != PinDirection::Input
+                || from_pin.data_type != to_pin.data_type
+            {
+                Log::warn(format!(
+                    "BlueprintEditor: CommitConnection rejected: from({:?},{:?}) to({:?},{:?})",
+                    from_pin.direction, from_pin.data_type, to_pin.direction, to_pin.data_type
+                ));
+                return;
+            }
+
+            Log::info(format!(
+                "BlueprintEditor: CommitConnection ok: {}({:?}) -> {}({:?})",
+                from_pin.name, from_pin.data_type, to_pin.name, to_pin.data_type
+            ));
+
+            // Each input pin can have only one incoming.
+            // Additionally, exec output pins can have only one outgoing.
+            if from_pin.data_type == DataType::Exec {
+                self.graph.links.retain(|l| l.to != to && l.from != from);
+            } else {
+                self.graph.links.retain(|l| l.to != to);
+            }
+            if !self.graph.links.iter().any(|l| l.from == from && l.to == to) {
+                self.graph.links.push(Link::exec(from, to));
+            }
+
+            self.rebuild_all_graph_views(ui);
+            return;
+        }
+
+        if let Some(TextMessage::Text(text)) = message.data::<TextMessage>() {
+            if let Some((node_id, key)) = view.node_text_box_binding.get(&message.destination()) {
+                if let Some(node) = self.graph.nodes.get_mut(node_id) {
+                    node.properties.insert(key.clone(), Value::String(text.clone()));
+                }
+            }
+        }
+    }
+
+    fn handle_extra_canvas_message(
+        &mut self,
+        message: &UiMessage,
+        ui: &mut UserInterface,
+        extra_index: usize,
+    ) -> bool {
+        let Some(tab) = self.extra_tabs.get(extra_index) else {
+            return false;
+        };
+        let canvas = tab.view.canvas;
+
+        if let Some(AbsmCanvasMessage::SelectionChanged(selection)) = message.data_from(canvas) {
+            let selected = {
+                let view = &self.extra_tabs[extra_index].view;
+                selection
+                    .iter()
+                    .find_map(|h| view.view_to_node.get(h).copied())
+            };
+            self.set_selected_node(ui, selected);
+            return true;
+        }
+
+        if let Some(AbsmCanvasMessage::CommitDrag { .. }) = message.data_from(canvas) {
+            let node_views: Vec<(NodeId, Handle<UiNode>)> = {
+                let view = &self.extra_tabs[extra_index].view;
+                view.node_views.iter().map(|(a, b)| (*a, *b)).collect()
+            };
+
+            for (node_id, node_view) in node_views {
+                let pos = ui.node(node_view).desired_local_position();
+                if let Some(node) = self.graph.nodes.get_mut(&node_id) {
+                    node.position = [pos.x, pos.y];
+                }
+            }
+            return true;
+        }
+
+        if let Some(AbsmCanvasMessage::CommitConnection {
+            source_socket,
+            dest_socket,
+        }) = message.data_from(canvas)
+        {
+            let (a, b) = {
+                let view = &self.extra_tabs[extra_index].view;
+                (
+                    view.socket_to_pin.get(source_socket).copied(),
+                    view.socket_to_pin.get(dest_socket).copied(),
+                )
+            };
+
+            let (Some(a), Some(b)) = (a, b) else {
+                Log::warn(
+                    "BlueprintEditor: CommitConnection rejected: unknown socket->pin mapping"
+                        .to_string(),
+                );
+                return true;
+            };
+
+            let a_dir = ui_node_socket_dir(ui, *source_socket);
+            let b_dir = ui_node_socket_dir(ui, *dest_socket);
+
+            let (from, to) = match (a_dir, b_dir) {
+                (Some(SocketDirection::Output), Some(SocketDirection::Input)) => (a, b),
+                (Some(SocketDirection::Input), Some(SocketDirection::Output)) => (b, a),
+                _ => {
+                    Log::warn(format!(
+                        "BlueprintEditor: CommitConnection rejected: socket directions {:?} -> {:?}",
+                        a_dir, b_dir
+                    ));
+                    return true;
+                }
+            };
+
+            let (Some(from_pin), Some(to_pin)) = (self.graph.pin(from), self.graph.pin(to)) else {
+                Log::warn("BlueprintEditor: CommitConnection rejected: missing pins".to_string());
+                return true;
+            };
+
+            if from_pin.direction != PinDirection::Output
+                || to_pin.direction != PinDirection::Input
+                || from_pin.data_type != to_pin.data_type
+            {
+                Log::warn(format!(
+                    "BlueprintEditor: CommitConnection rejected: from({:?},{:?}) to({:?},{:?})",
+                    from_pin.direction, from_pin.data_type, to_pin.direction, to_pin.data_type
+                ));
+                return true;
+            }
+
+            // Each input pin can have only one incoming.
+            // Additionally, exec output pins can have only one outgoing.
+            if from_pin.data_type == DataType::Exec {
+                self.graph.links.retain(|l| l.to != to && l.from != from);
+            } else {
+                self.graph.links.retain(|l| l.to != to);
+            }
+            if !self.graph.links.iter().any(|l| l.from == from && l.to == to) {
+                self.graph.links.push(Link::exec(from, to));
+            }
+
+            self.rebuild_all_graph_views(ui);
+            return true;
+        }
+
+        if let Some(TextMessage::Text(text)) = message.data::<TextMessage>() {
+            let binding = {
+                let view = &self.extra_tabs[extra_index].view;
+                view.node_text_box_binding
+                    .get(&message.destination())
+                    .cloned()
+            };
+
+            if let Some((node_id, key)) = binding {
+                if let Some(node) = self.graph.nodes.get_mut(&node_id) {
+                    node.properties.insert(key.clone(), Value::String(text.clone()));
+                }
+            }
+        }
+
+        false
+    }
+}
+
+fn make_tab(name: &str, content: Handle<UiNode>, ctx: &mut BuildContext) -> TabDefinition {
+    TabDefinition {
+        header: TextBuilder::new(WidgetBuilder::new().with_margin(Thickness::uniform(6.0)))
+            .with_text(name)
+            .build(ctx),
+        content,
+        can_be_closed: false,
+        user_data: None,
+    }
+}
+
+fn spawn_connection_view(
+    ui: &mut UserInterface,
+    view: &mut GraphView,
+    from: PinId,
+    to: PinId,
+    data_type: DataType,
+    is_exec: bool,
+) {
+    let Some(source_socket) = view.pin_to_socket.get(&from).copied() else {
+        return;
+    };
+    let Some(dest_socket) = view.pin_to_socket.get(&to).copied() else {
+        return;
+    };
+
+    let Some(source_node_id) = view.pin_to_node.get(&from).copied() else {
+        return;
+    };
+    let Some(dest_node_id) = view.pin_to_node.get(&to).copied() else {
+        return;
+    };
+
+    let Some(source_node_view) = view.node_views.get(&source_node_id).copied() else {
+        return;
+    };
+    let Some(dest_node_view) = view.node_views.get(&dest_node_id).copied() else {
+        return;
+    };
+
+    // Unreal-like: exec is white; data wires are type-colored (matching pin colors).
+    let base_color = match data_type {
+        DataType::Exec => fyrox::core::color::Color::WHITE,
+        DataType::Bool => fyrox::core::color::Color::opaque(200, 70, 70),
+        DataType::I32 => fyrox::core::color::Color::opaque(60, 200, 220),
+        DataType::F32 => fyrox::core::color::Color::opaque(90, 200, 90),
+        DataType::String => fyrox::core::color::Color::opaque(240, 80, 200),
+        DataType::Unit => fyrox::core::color::Color::opaque(140, 140, 140),
+    };
+
+    let hover_color = fyrox::core::color::Color::opaque(
+        base_color.r.saturating_add(40),
+        base_color.g.saturating_add(40),
+        base_color.b.saturating_add(40),
+    );
+
+    let connection = ConnectionBuilder::new(WidgetBuilder::new())
+        .with_source_socket(source_socket)
+        .with_dest_socket(dest_socket)
+        .with_source_node(source_node_view)
+        .with_dest_node(dest_node_view)
+        .with_brushes(
+            fyrox::gui::brush::Brush::Solid(base_color),
+            fyrox::gui::brush::Brush::Solid(hover_color),
+        )
+        .with_thickness(if is_exec { 6.0 } else { 4.0 })
+        .build(view.canvas, &mut ui.build_ctx());
+
+    ui.send_sync(connection, WidgetMessage::LinkWith(view.canvas));
+    view.connection_views.push(connection);
+}
+
+fn set_pin_data_type_by_name(node: &mut Node, pin_name: &str, data_type: DataType) {
+    if let Some(pin) = node.pins.iter_mut().find(|p| p.name == pin_name) {
+        pin.data_type = data_type;
+    }
+}
+
+fn data_type_label(dt: DataType) -> &'static str {
+    match dt {
+        DataType::Bool => "Bool",
+        DataType::I32 => "Int",
+        DataType::F32 => "Float",
+        DataType::String => "String",
+        DataType::Exec => "Exec",
+        DataType::Unit => "Unit",
+    }
+}
+
+fn ui_node_socket_dir(ui: &UserInterface, socket: Handle<UiNode>) -> Option<SocketDirection> {
+    ui.node(socket)
+        .query_component::<Socket>()
+        .map(|s| s.direction)
+}
+
+#[derive(Default)]
+pub struct BlueprintEditorPlugin {
+    editor: Option<BlueprintEditor>,
+}
+
+impl EditorPlugin for BlueprintEditorPlugin {
+    fn on_ui_message(&mut self, message: &mut UiMessage, editor: &mut Editor) {
+        let Some(bp) = self.editor.as_mut() else {
+            return;
+        };
+
+        bp.handle_ui_message(message, &mut editor.engine);
+
+        if let Some(WindowMessage::Close) = message.data() {
+            if message.destination() == bp.window {
+                editor
+                    .engine
+                    .user_interfaces
+                    .first()
+                    .send(bp.window, WidgetMessage::Remove);
+                self.editor = None;
+            }
+        }
+    }
+
+    fn on_message(&mut self, message: &Message, editor: &mut Editor) {
+        let Message::OpenBlueprintEditor(path) = message else {
+            return;
+        };
+
+        let bp = self
+            .editor
+            .get_or_insert_with(|| BlueprintEditor::new(&mut editor.engine));
+        bp.open(editor, path.clone());
+    }
+}

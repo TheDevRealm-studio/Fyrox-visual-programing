@@ -81,6 +81,7 @@ pub enum Message {
     OpenMaterialEditor(MaterialResource),
     OpenTileSetEditor(TileSetResource),
     OpenTileMapBrushEditor(TileMapBrushResource),
+    OpenBlueprintEditor(PathBuf),
     OpenNodeRemovalDialog,
     ShowInAssetBrowser(PathBuf),
     LocateObject {

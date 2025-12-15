@@ -38,8 +38,10 @@ use crate::utils::fetch_node_screen_center;
 use fyrox::material::MaterialResource;
 use std::ops::{Deref, DerefMut};
 
-const PICKED_BRUSH: Brush = Brush::Solid(Color::opaque(100, 100, 100));
-const NORMAL_BRUSH: Brush = Brush::Solid(Color::opaque(80, 80, 80));
+const DEFAULT_HOVER_BRUSH: Brush = Brush::Solid(Color::opaque(120, 120, 120));
+const DEFAULT_NORMAL_BRUSH: Brush = Brush::Solid(Color::opaque(80, 80, 80));
+
+const OUTLINE_COLOR: Color = Color::from_rgba(0, 0, 0, 200);
 
 #[derive(Debug, Clone, Visit, Reflect, ComponentProvider)]
 #[reflect(derived_type = "UiNode")]
@@ -48,9 +50,24 @@ pub struct Connection {
     pub segment: Segment,
     pub source_node: Handle<UiNode>,
     pub dest_node: Handle<UiNode>,
+    thickness: f32,
+    normal_brush: Brush,
+    hover_brush: Brush,
 }
 
 define_widget_deref!(Connection);
+
+fn color_with_alpha(mut color: Color, alpha: u8) -> Color {
+    color.a = alpha;
+    color
+}
+
+fn solid_color_or_fallback(brush: &Brush, fallback: Color) -> Color {
+    match brush {
+        Brush::Solid(c) => *c,
+        _ => fallback,
+    }
+}
 
 pub fn draw_connection(
     drawing_context: &mut DrawingContext,
@@ -58,16 +75,56 @@ pub fn draw_connection(
     dest: Vector2<f32>,
     clip_bounds: Rect<f32>,
     brush: Brush,
+    thickness: f32,
     material: &MaterialResource,
 ) {
-    let k = 75.0;
+    // Unreal-like: curvature depends on distance but stays within a readable range.
+    let dx = (dest.x - source.x).abs();
+    let dy = (dest.y - source.y).abs();
+    let distance = (dx * dx + dy * dy).sqrt();
+    let k = ((dx.max(distance * 0.35)) * 0.5).clamp(50.0, 180.0);
+
+    // Multi-pass wire rendering for clarity:
+    // 1) soft glow pass (also improves hit-testing due to wider geometry)
+    // 2) dark outline pass
+    // 3) colored inner pass
+
+    let inner_color = solid_color_or_fallback(&brush, Color::WHITE);
+    let glow_brush = Brush::Solid(color_with_alpha(inner_color, 35));
+    let outline_brush = Brush::Solid(OUTLINE_COLOR);
+
+    let segments = 32;
+
+    // Glow.
     drawing_context.push_bezier(
         source,
         source + Vector2::new(k, 0.0),
         dest - Vector2::new(k, 0.0),
         dest,
-        20,
-        4.0,
+        segments,
+        thickness + 8.0,
+    );
+    drawing_context.commit(clip_bounds, glow_brush, CommandTexture::None, material, None);
+
+    // Outline.
+    drawing_context.push_bezier(
+        source,
+        source + Vector2::new(k, 0.0),
+        dest - Vector2::new(k, 0.0),
+        dest,
+        segments,
+        thickness + 2.0,
+    );
+    drawing_context.commit(clip_bounds, outline_brush, CommandTexture::None, material, None);
+
+    // Inner.
+    drawing_context.push_bezier(
+        source,
+        source + Vector2::new(k, 0.0),
+        dest - Vector2::new(k, 0.0),
+        dest,
+        segments,
+        thickness,
     );
     drawing_context.commit(clip_bounds, brush, CommandTexture::None, material, None);
 }
@@ -82,6 +139,7 @@ impl Control for Connection {
             self.segment.dest_pos,
             self.clip_bounds(),
             self.foreground(),
+            self.thickness,
             &self.material,
         );
     }
@@ -97,13 +155,14 @@ impl Control for Connection {
                 WidgetMessage::MouseEnter => {
                     ui.send(
                         self.handle(),
-                        WidgetMessage::Foreground(PICKED_BRUSH.clone().into()),
+                        WidgetMessage::Foreground(self.hover_brush.clone().into()),
                     );
+                    ui.send(self.handle(), WidgetMessage::Topmost);
                 }
                 WidgetMessage::MouseLeave => {
                     ui.send(
                         self.handle(),
-                        WidgetMessage::Foreground(NORMAL_BRUSH.clone().into()),
+                        WidgetMessage::Foreground(self.normal_brush.clone().into()),
                     );
                 }
                 _ => (),
@@ -118,6 +177,9 @@ pub struct ConnectionBuilder {
     source_node: Handle<UiNode>,
     dest_socket: Handle<UiNode>,
     dest_node: Handle<UiNode>,
+    thickness: f32,
+    normal_brush: Brush,
+    hover_brush: Brush,
 }
 
 impl ConnectionBuilder {
@@ -128,7 +190,21 @@ impl ConnectionBuilder {
             source_node: Default::default(),
             dest_socket: Default::default(),
             dest_node: Default::default(),
+            thickness: 4.0,
+            normal_brush: DEFAULT_NORMAL_BRUSH.clone(),
+            hover_brush: DEFAULT_HOVER_BRUSH.clone(),
         }
+    }
+
+    pub fn with_brushes(mut self, normal: Brush, hover: Brush) -> Self {
+        self.normal_brush = normal;
+        self.hover_brush = hover;
+        self
+    }
+
+    pub fn with_thickness(mut self, thickness: f32) -> Self {
+        self.thickness = thickness;
+        self
     }
 
     pub fn with_source_socket(mut self, source: Handle<UiNode>) -> Self {
@@ -157,7 +233,7 @@ impl ConnectionBuilder {
         let connection = Connection {
             widget: self
                 .widget_builder
-                .with_foreground(NORMAL_BRUSH.into())
+                .with_foreground(self.normal_brush.clone().into())
                 .with_clip_to_bounds(false)
                 .build(ctx),
             segment: Segment {
@@ -172,6 +248,9 @@ impl ConnectionBuilder {
             },
             source_node: self.source_node,
             dest_node: self.dest_node,
+            thickness: self.thickness,
+            normal_brush: self.normal_brush,
+            hover_brush: self.hover_brush,
         };
 
         ctx.add_node(UiNode::new(connection))

@@ -31,6 +31,8 @@ image = { version = "0.25.1", default-features = false, features = ["gif", "jpeg
 imageproc = "0.25.0"
 notify = "8"
 bitflags = "2.9.1"
+fyrox-blueprint = { path = "../fyrox-blueprint" }
+fyrox-visual-scripting = { path = "../fyrox-visual-scripting" }
 
 [features]
 default = ["fyrox/default"]

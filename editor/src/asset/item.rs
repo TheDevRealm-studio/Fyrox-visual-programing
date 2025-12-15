@@ -174,6 +174,8 @@ impl AssetItem {
                     Err(err) => Log::err(format!("Open tile_map_brush error: {err:?}")),
                 }
             }
+        } else if self.path.extension().is_some_and(|ext| ext == "blueprint") {
+            sender.send(Message::OpenBlueprintEditor(self.path.clone()));
         } else if self.path.is_dir() {
             sender.send(Message::SetAssetBrowserCurrentDir(self.path.clone()));
         } else {

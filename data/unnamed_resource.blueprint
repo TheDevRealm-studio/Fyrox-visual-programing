@@ -1,0 +1,5 @@
+FTAX:0;
+__ROOT__[]
+{
+	Blueprint[Version<u32:1>GraphJson<str:"{\"id\":\"Blueprint\",\"nodes\":{},\"links\":[],\"next_node_id\":1,\"next_pin_id\":1}">]{}
+}
