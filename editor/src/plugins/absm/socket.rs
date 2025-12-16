@@ -72,9 +72,10 @@ pub struct Socket {
 
 define_widget_deref!(Socket);
 
-const RADIUS: f32 = 6.0;
+// More compact (UE-like) pins.
+const RADIUS: f32 = 5.0;
 const PIN_SIZE: f32 = RADIUS * 2.0;
-const SOCKET_HEIGHT: f32 = 28.0;
+const SOCKET_HEIGHT: f32 = 22.0;
 
 uuid_provider!(Socket = "a6c0473e-7073-4e91-a681-cf88795af52a");
 

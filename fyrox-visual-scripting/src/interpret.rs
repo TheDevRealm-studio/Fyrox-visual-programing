@@ -1,8 +1,12 @@
 use crate::{
     compile::CompiledGraph,
     model::{BuiltinNodeKind, DataType, NodeId, Value},
+    runtime::runtime_for,
 };
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+
+use rhai::{Dynamic, Engine, EvalAltResult, FLOAT, INT};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExecutionEvent {
@@ -19,6 +23,38 @@ pub struct InterpreterOutput {
 pub struct Interpreter {
     compiled: CompiledGraph,
     variables: BTreeMap<String, Value>,
+}
+
+fn value_to_dynamic(v: &Value) -> Dynamic {
+    match v {
+        Value::Bool(b) => (*b).into(),
+        Value::I32(i) => (INT::from(*i)).into(),
+        Value::F32(f) => (FLOAT::from(*f)).into(),
+        Value::String(s) => s.clone().into(),
+        Value::Unit => Dynamic::UNIT,
+    }
+}
+
+fn dynamic_to_value(v: &Dynamic) -> Option<Value> {
+    if v.is_unit() {
+        return Some(Value::Unit);
+    }
+    if v.is::<bool>() {
+        return Some(Value::Bool(v.clone_cast::<bool>()));
+    }
+    if v.is::<INT>() {
+        let i = v.clone_cast::<INT>();
+        return i32::try_from(i).ok().map(Value::I32);
+    }
+    if v.is::<FLOAT>() {
+        let f = v.clone_cast::<FLOAT>();
+        return Some(Value::F32(f as f32));
+    }
+    if v.is::<String>() {
+        return Some(Value::String(v.clone_cast::<String>()));
+    }
+
+    None
 }
 
 impl Interpreter {
@@ -78,90 +114,95 @@ impl Interpreter {
 
             out.events.push(ExecutionEvent::EnterNode(node_id));
 
-            let Some(node) = self.compiled.nodes.get(&node_id) else {
+            let Some(node) = self.compiled.nodes.get(&node_id).cloned() else {
                 break;
             };
 
-            match node.kind {
-                BuiltinNodeKind::Print => {
-                    // Prefer linked input, otherwise literal property "text".
-                    let text = self.read_string_input(node_id, "text")
-                        .or_else(|| node.properties.get("text").and_then(|v| match v {
-                            Value::String(s) => Some(s.clone()),
-                            _ => None,
-                        }))
-                        .unwrap_or_default();
-
-                    out.events.push(ExecutionEvent::Print(text));
-                    next_exec_in_pin = self.next_exec(node_id, "then");
-                }
-                BuiltinNodeKind::Branch => {
-                    let cond = self
-                        .read_bool_input(node_id, "condition")
-                        .or_else(|| node.properties.get("condition").and_then(|v| match v {
-                            Value::Bool(b) => Some(*b),
-                            _ => None,
-                        }))
-                        .unwrap_or(false);
-
-                    next_exec_in_pin = if cond {
-                        self.next_exec(node_id, "true")
-                    } else {
-                        self.next_exec(node_id, "false")
-                    };
-                }
-                BuiltinNodeKind::SetVariable => {
-                    let name = node
-                        .properties
-                        .get("name")
-                        .and_then(|v| match v {
-                            Value::String(s) => Some(s.clone()),
-                            _ => None,
-                        })
-                        .unwrap_or_else(|| "var".to_string());
-
-                    let expected_ty = self
-                        .compiled
-                        .nodes
-                        .get(&node_id)
-                        .and_then(|n| n.pin("value"))
-                        .map(|(_, _, ty)| ty)
-                        .unwrap_or(DataType::Unit);
-
-                    let value = self
-                        .read_value_input(node_id, "value")
-                        .or_else(|| {
-                            node.properties.get("value").and_then(|v| {
-                                if v.data_type() == expected_ty {
-                                    Some(v.clone())
-                                } else {
-                                    None
-                                }
-                            })
-                        })
-                        .unwrap_or(Value::Unit);
-
-                    self.variables.insert(name, value);
-                    next_exec_in_pin = self.next_exec(node_id, "then");
-                }
-                // Entry nodes are never executed here; we jump from them.
-                BuiltinNodeKind::BeginPlay
-                | BuiltinNodeKind::ConstructionScript
-                | BuiltinNodeKind::Tick
-                | BuiltinNodeKind::GetVariable
-                | BuiltinNodeKind::Self_
-                | BuiltinNodeKind::GetActorTransform
-                | BuiltinNodeKind::SetActorTransform
-                | BuiltinNodeKind::SpawnActor
-                | BuiltinNodeKind::GetActorByName
-                | BuiltinNodeKind::GetActorName => {
-                    next_exec_in_pin = self.next_exec(node_id, "then");
-                }
-            }
+            next_exec_in_pin = runtime_for(node.kind).execute(self, &mut out, node_id, &node);
         }
 
         out.variables = self.variables.clone();
         out
+    }
+
+    pub(crate) fn execute_rhai(
+        &mut self,
+        code: &str,
+        out: &mut InterpreterOutput,
+    ) -> Result<(), Box<EvalAltResult>> {
+        // Shared buffers for Rhai callbacks.
+        let emitted = Arc::new(Mutex::new(Vec::<ExecutionEvent>::new()));
+        let vars = Arc::new(Mutex::new(self.variables.clone()));
+
+        let mut engine = Engine::new();
+
+        // Blueprint-integrated print.
+        {
+            let emitted = emitted.clone();
+            engine.register_fn("print", move |text: &str| {
+                if let Ok(mut events) = emitted.lock() {
+                    events.push(ExecutionEvent::Print(text.to_string()));
+                }
+            });
+        }
+
+        // Variable bridge.
+        {
+            let vars = vars.clone();
+            engine.register_fn("get_var", move |name: &str| -> Dynamic {
+                let Ok(vars) = vars.lock() else {
+                    return Dynamic::UNIT;
+                };
+                vars.get(name)
+                    .map(value_to_dynamic)
+                    .unwrap_or(Dynamic::UNIT)
+            });
+        }
+        {
+            let vars = vars.clone();
+            engine.register_fn("set_var", move |name: &str, value: Dynamic| {
+                let Some(v) = dynamic_to_value(&value) else {
+                    return;
+                };
+                if let Ok(mut vars) = vars.lock() {
+                    vars.insert(name.to_string(), v);
+                }
+            });
+        }
+        {
+            let vars = vars.clone();
+            engine.register_fn("dt", move || -> FLOAT {
+                let Ok(vars) = vars.lock() else {
+                    return FLOAT::from(0.0_f32);
+                };
+                match vars.get("__dt") {
+                    Some(Value::F32(f)) => FLOAT::from(*f),
+                    _ => FLOAT::from(0.0_f32),
+                }
+            });
+        }
+
+        let result: Result<Dynamic, Box<EvalAltResult>> = engine.eval(code);
+
+        if let Ok(vars_guard) = vars.lock() {
+            self.variables = vars_guard.clone();
+        }
+
+        if let Ok(mut events) = emitted.lock() {
+            out.events.extend(events.drain(..));
+        }
+
+        result.map(|_| ())
+    }
+
+    pub(crate) fn set_variable(&mut self, name: String, value: Value) {
+        self.variables.insert(name, value);
+    }
+
+    pub(crate) fn input_pin_type(&self, node_id: NodeId, input_name: &str) -> Option<DataType> {
+        let node = self.compiled.nodes.get(&node_id)?;
+        let (_, _, ty) = node.pin(input_name)?;
+        Some(ty)
     }
 
     fn pin_owner(&self, pin_id: crate::model::PinId) -> Option<NodeId> {
@@ -177,7 +218,11 @@ impl Interpreter {
             })
     }
 
-    fn next_exec(&self, node_id: NodeId, exec_out_name: &str) -> Option<crate::model::PinId> {
+    pub(crate) fn next_exec(
+        &self,
+        node_id: NodeId,
+        exec_out_name: &str,
+    ) -> Option<crate::model::PinId> {
         let node = self.compiled.nodes.get(&node_id)?;
         let (out_pin, _, ty) = node.pin(exec_out_name)?;
         if ty != DataType::Exec {
@@ -186,21 +231,21 @@ impl Interpreter {
         self.compiled.exec_edges.get(&out_pin).copied()
     }
 
-    fn read_string_input(&self, node_id: NodeId, input_name: &str) -> Option<String> {
+    pub(crate) fn read_string_input(&self, node_id: NodeId, input_name: &str) -> Option<String> {
         match self.read_value_input(node_id, input_name)? {
             Value::String(s) => Some(s),
             _ => None,
         }
     }
 
-    fn read_bool_input(&self, node_id: NodeId, input_name: &str) -> Option<bool> {
+    pub(crate) fn read_bool_input(&self, node_id: NodeId, input_name: &str) -> Option<bool> {
         match self.read_value_input(node_id, input_name)? {
             Value::Bool(b) => Some(b),
             _ => None,
         }
     }
 
-    fn read_value_input(&self, node_id: NodeId, input_name: &str) -> Option<Value> {
+    pub(crate) fn read_value_input(&self, node_id: NodeId, input_name: &str) -> Option<Value> {
         let node = self.compiled.nodes.get(&node_id)?;
         let (input_pin, _, expected_ty) = node.pin(input_name)?;
 

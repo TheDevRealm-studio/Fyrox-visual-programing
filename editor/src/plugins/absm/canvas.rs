@@ -73,6 +73,11 @@ pub enum Mode {
     Drag {
         drag_context: DragContext,
     },
+    Marquee {
+        start: Vector2<f32>,
+        end: Vector2<f32>,
+        additive: bool,
+    },
     CreateTransition {
         source: Handle<UiNode>,
         source_pos: Vector2<f32>,
@@ -95,6 +100,12 @@ pub enum AbsmCanvasMessage {
     CommitConnection {
         source_socket: Handle<UiNode>,
         dest_socket: Handle<UiNode>,
+    },
+
+    /// User dragged a socket and released on empty space (no destination socket).
+    /// The editor may use this to open an action menu and auto-connect a spawned node.
+    CommitConnectionToEmpty {
+        source_socket: Handle<UiNode>,
     },
     CommitDrag {
         entries: Vec<Entry>,
@@ -358,6 +369,30 @@ impl Control for AbsmCanvas {
         );
 
         match &self.mode {
+            Mode::Marquee { start, end, .. } => {
+                let min = Vector2::new(start.x.min(end.x), start.y.min(end.y));
+                let max = Vector2::new(start.x.max(end.x), start.y.max(end.y));
+                let rect = Rect::new(min.x, min.y, (max.x - min.x).max(0.0), (max.y - min.y).max(0.0));
+
+                // Subtle filled selection rectangle + brighter outline (UE-like).
+                ctx.push_rect_filled(&rect, None);
+                ctx.commit(
+                    self.clip_bounds(),
+                    Brush::Solid(Color::from_rgba(80, 160, 255, 40)),
+                    CommandTexture::None,
+                    &self.material,
+                    None,
+                );
+
+                ctx.push_rect(&rect, 1.0);
+                ctx.commit(
+                    self.clip_bounds(),
+                    Brush::Solid(Color::from_rgba(120, 200, 255, 200)),
+                    CommandTexture::None,
+                    &self.material,
+                    None,
+                );
+            }
             Mode::CreateTransition {
                 source_pos,
                 dest_pos,
@@ -416,6 +451,11 @@ impl Control for AbsmCanvas {
             );
         }
 
+        // When the canvas is moved/resized (for example, by docking or window resize), the screen
+        // positions of sockets change even if node local positions don't. Keep connection ends in
+        // sync so wires do not disappear until the next interaction.
+        self.force_sync_dependent_objects(ui);
+
         final_size
     }
 
@@ -468,7 +508,14 @@ impl Control for AbsmCanvas {
                                 drag_context: self.make_drag_context(ui),
                             }
                         } else {
-                            self.set_selection(&[], ui);
+                            // Start marquee selection on empty space.
+                            let start = self.point_to_local_space(*pos);
+                            self.mode = Mode::Marquee {
+                                start,
+                                end: start,
+                                additive: ui.keyboard_modifiers().control,
+                            };
+                            ui.capture_mouse(self.handle());
                         }
                     }
 
@@ -493,6 +540,60 @@ impl Control for AbsmCanvas {
                         }
 
                         self.mode = Mode::Normal;
+                    }
+                    Mode::Marquee {
+                        start,
+                        end,
+                        additive,
+                    } => {
+                        ui.release_mouse_capture();
+
+                        let min = Vector2::new(start.x.min(end.x), start.y.min(end.y));
+                        let max = Vector2::new(start.x.max(end.x), start.y.max(end.y));
+
+                        // Treat a very small marquee as a normal click on empty space.
+                        let is_click = (max.x - min.x).abs() < 2.0 && (max.y - min.y).abs() < 2.0;
+                        if is_click {
+                            if !additive {
+                                self.set_selection(&[], ui);
+                            }
+                            self.mode = Mode::Normal;
+                            self.invalidate_visual();
+                            return;
+                        }
+
+                        let selection_rect = Rect::new(min.x, min.y, max.x - min.x, max.y - min.y);
+                        let mut new_selection: Vec<Handle<UiNode>> = if additive {
+                            self.selection.clone()
+                        } else {
+                            Vec::new()
+                        };
+
+                        // Select every node that intersects the marquee.
+                        for &child in self.children() {
+                            if ui.node(child).has_component::<AbsmBaseNode>() {
+                                let n = ui.node(child);
+                                let top_left = self.point_to_local_space(n.screen_position());
+                                let bottom_right =
+                                    self.point_to_local_space(n.screen_position() + n.actual_global_size());
+                                let node_min = Vector2::new(top_left.x.min(bottom_right.x), top_left.y.min(bottom_right.y));
+                                let node_max = Vector2::new(top_left.x.max(bottom_right.x), top_left.y.max(bottom_right.y));
+                                let node_rect = Rect::new(
+                                    node_min.x,
+                                    node_min.y,
+                                    node_max.x - node_min.x,
+                                    node_max.y - node_min.y,
+                                );
+
+                                if selection_rect.intersects(node_rect) && !new_selection.contains(&child) {
+                                    new_selection.push(child);
+                                }
+                            }
+                        }
+
+                        self.set_selection(&new_selection, ui);
+                        self.mode = Mode::Normal;
+                        self.invalidate_visual();
                     }
                     Mode::CreateConnection { source, .. } => {
                         let dest_socket_handle = self
@@ -528,6 +629,15 @@ impl Control for AbsmCanvas {
                                     },
                                 );
                             }
+                        } else {
+                            // Dragged to empty space - let the editor decide what to do (usually: open
+                            // an action menu and auto-connect to a newly spawned node).
+                            ui.post(
+                                self.handle(),
+                                AbsmCanvasMessage::CommitConnectionToEmpty {
+                                    source_socket: source,
+                                },
+                            );
                         }
 
                         self.mode = Mode::Normal;
@@ -542,18 +652,22 @@ impl Control for AbsmCanvas {
                 self.update_transform(ui);
             }
 
+            let local_mouse_pos = self.point_to_local_space(*pos);
+
             let local_cursor_position = self.screen_to_local(ui.cursor_position());
 
             match self.mode {
                 Mode::Drag { ref drag_context } => {
                     for entry in drag_context.entries.iter() {
-                        let local_cursor_pos = self.point_to_local_space(*pos);
-
                         let new_position = entry.initial_position
-                            + (local_cursor_pos - drag_context.initial_cursor_position);
+                            + (local_mouse_pos - drag_context.initial_cursor_position);
 
                         ui.send(entry.node, WidgetMessage::DesiredPosition(new_position));
                     }
+                }
+                Mode::Marquee { ref mut end, .. } => {
+                    *end = local_mouse_pos;
+                    self.invalidate_visual();
                 }
                 Mode::CreateTransition {
                     ref mut dest_pos, ..

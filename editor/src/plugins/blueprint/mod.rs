@@ -13,13 +13,16 @@ use crate::{
         engine::Engine,
         graph::BaseSceneGraph,
         gui::{
+            border::BorderBuilder,
             check_box::{CheckBoxBuilder, CheckBoxMessage},
             button::{ButtonBuilder, ButtonMessage},
             dock::{DockingManagerBuilder, DockingManagerMessage, TileBuilder, TileContent},
             dropdown_list::{DropdownListBuilder, DropdownListMessage},
             grid::{Column, GridBuilder, Row},
-            message::UiMessage,
+            list_view::{ListViewBuilder, ListViewMessage},
+            message::{MessageDirection, MouseButton, UiMessage},
             numeric::{NumericUpDownBuilder, NumericUpDownMessage},
+            popup::{Placement, PopupBuilder, PopupMessage},
             scroll_viewer::ScrollViewerBuilder,
             stack_panel::StackPanelBuilder,
             tab_control::{TabControlBuilder, TabControlMessage, TabDefinition},
@@ -36,6 +39,7 @@ use crate::{
     Editor, Message,
 };
 use fyrox::gui::window::WindowAlignment;
+use fyrox::gui::style::{resource::StyleResourceExt, Style};
 use fyrox_blueprint::BlueprintAsset;
 use fyrox_visual_scripting::{
     compile, BlueprintGraph, BuiltinNodeKind, DataType, GraphKind, Link, Node, NodeId, PinDirection,
@@ -137,6 +141,21 @@ enum DetailsBinding {
     VariableType { index: usize },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActionMenuAction {
+    SpawnBuiltin(BuiltinNodeKind),
+    SpawnGetVariable(usize),
+    SpawnSetVariable(usize),
+}
+
+#[derive(Debug, Clone)]
+struct PendingConnection {
+    from: PinId,
+    from_dir: PinDirection,
+    from_type: DataType,
+    graph_name: String,
+}
+
 struct BlueprintEditor {
     window: fyrox::core::pool::Handle<UiNode>,
     save: fyrox::core::pool::Handle<UiNode>,
@@ -167,6 +186,15 @@ struct BlueprintEditor {
     selected_variable: Option<usize>,
 
     node_palette_buttons: HashMap<Handle<UiNode>, BuiltinNodeKind>,
+
+    action_menu: Handle<UiNode>,
+    action_menu_search: Handle<UiNode>,
+    action_menu_list: Handle<UiNode>,
+    action_menu_button_actions: HashMap<Handle<UiNode>, ActionMenuAction>,
+    action_menu_spawn_graph: Option<String>,
+    action_menu_spawn_position: Option<fyrox::core::algebra::Vector2<f32>>,
+
+    pending_connection: Option<PendingConnection>,
 
     active_tab: BlueprintGraphTab,
     active_extra_tab: Option<usize>,
@@ -211,6 +239,10 @@ impl BlueprintEditor {
         let my_blueprint_new_function;
         let my_blueprint_functions_panel;
         let details_panel;
+
+        let action_menu;
+        let action_menu_search;
+        let action_menu_list;
 
         let event_canvas;
         let construction_canvas;
@@ -414,6 +446,55 @@ impl BlueprintEditor {
             )
             .build(ctx);
 
+        // Unreal-like right-click action menu (search + list of node actions).
+        action_menu = {
+            let content = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_width(340.0)
+                    .with_max_size(fyrox::core::algebra::Vector2::new(340.0, 420.0))
+                    .with_background(ctx.style.property(Style::BRUSH_DARKER))
+                    .with_foreground(ctx.style.property(Style::BRUSH_LIGHT))
+                    .with_child(
+                        GridBuilder::new(
+                            WidgetBuilder::new()
+                                .with_margin(Thickness::uniform(6.0))
+                                .with_child({
+                                    action_menu_search = TextBoxBuilder::new(
+                                        WidgetBuilder::new()
+                                            .on_row(0)
+                                            .with_height(24.0),
+                                    )
+                                    .with_text("")
+                                    .build(ctx);
+                                    action_menu_search
+                                })
+                                .with_child({
+                                    action_menu_list = ListViewBuilder::new(
+                                        WidgetBuilder::new()
+                                            .on_row(1)
+                                            .with_min_size(fyrox::core::algebra::Vector2::new(
+                                                0.0,
+                                                260.0,
+                                            )),
+                                    )
+                                    .build(ctx);
+                                    action_menu_list
+                                }),
+                        )
+                        .add_row(Row::auto())
+                        .add_row(Row::stretch())
+                        .add_column(Column::stretch())
+                        .build(ctx),
+                    ),
+            )
+            .with_pad_by_corner_radius(false)
+            .build(ctx);
+
+            PopupBuilder::new(WidgetBuilder::new().with_visibility(false))
+                .with_content(content)
+                .build(ctx)
+        };
+
         let docking_manager = DockingManagerBuilder::new(WidgetBuilder::new().on_row(1).with_child({
             TileBuilder::new(WidgetBuilder::new())
                 .with_content(TileContent::HorizontalTiles {
@@ -498,6 +579,15 @@ impl BlueprintEditor {
 
             node_palette_buttons,
 
+            action_menu,
+            action_menu_search,
+            action_menu_list,
+            action_menu_button_actions: HashMap::new(),
+            action_menu_spawn_graph: None,
+            action_menu_spawn_position: None,
+
+            pending_connection: None,
+
             active_tab: BlueprintGraphTab::EventGraph,
             active_extra_tab: None,
 
@@ -509,6 +599,186 @@ impl BlueprintEditor {
             construction_view: GraphView::new(construction_canvas),
 
             extra_tabs: Vec::new(),
+        }
+    }
+
+    fn rebuild_action_menu_items(&mut self, ui: &mut UserInterface, filter: &str) {
+        self.action_menu_button_actions.clear();
+
+        let needle = filter.trim().to_lowercase();
+        let mut entries: Vec<(String, ActionMenuAction)> = Vec::new();
+
+        // Built-in nodes.
+        let builtins: &[(BuiltinNodeKind, &str)] = &[
+            (BuiltinNodeKind::BeginPlay, "BeginPlay"),
+            (BuiltinNodeKind::Tick, "Tick"),
+            (BuiltinNodeKind::ConstructionScript, "Construction Script"),
+            (BuiltinNodeKind::Print, "Print"),
+            (BuiltinNodeKind::RhaiScript, "Rhai Script"),
+            (BuiltinNodeKind::Branch, "Branch"),
+            (BuiltinNodeKind::Self_, "Self"),
+            (BuiltinNodeKind::GetActorTransform, "Get Actor Transform"),
+            (BuiltinNodeKind::SetActorTransform, "Set Actor Transform"),
+            (BuiltinNodeKind::SpawnActor, "Spawn Actor"),
+            (BuiltinNodeKind::GetActorByName, "Get Actor By Name"),
+            (BuiltinNodeKind::GetActorName, "Get Actor Name"),
+        ];
+        for (kind, label) in builtins.iter().copied() {
+            entries.push((label.to_string(), ActionMenuAction::SpawnBuiltin(kind)));
+        }
+
+        // Variable shortcuts.
+        for (i, var) in self.graph.variables.iter().enumerate() {
+            entries.push((
+                format!("Get {}", var.name),
+                ActionMenuAction::SpawnGetVariable(i),
+            ));
+            entries.push((
+                format!("Set {}", var.name),
+                ActionMenuAction::SpawnSetVariable(i),
+            ));
+        }
+
+        if !needle.is_empty() {
+            entries.retain(|(label, _)| label.to_lowercase().contains(&needle));
+        }
+
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut item_widgets = Vec::new();
+        if entries.is_empty() {
+            let t = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_height(22.0)
+                    .with_margin(Thickness::uniform(4.0)),
+            )
+            .with_text("No results")
+            .build(&mut ui.build_ctx());
+            item_widgets.push(t);
+        } else {
+            for (label, action) in entries {
+                let b = ButtonBuilder::new(
+                    WidgetBuilder::new()
+                        .with_height(22.0)
+                        .with_margin(Thickness::uniform(2.0)),
+                )
+                .with_text(&label)
+                .build(&mut ui.build_ctx());
+                self.action_menu_button_actions.insert(b, action);
+                item_widgets.push(b);
+            }
+        }
+
+        ui.send(self.action_menu_list, ListViewMessage::Items(item_widgets));
+    }
+
+    fn open_action_menu(&mut self, ui: &mut UserInterface, canvas: Handle<UiNode>, graph: String) {
+        let Some(canvas_ref) = ui.node(canvas).query_component::<AbsmCanvas>() else {
+            return;
+        };
+
+        self.action_menu_spawn_graph = Some(graph);
+        self.action_menu_spawn_position = Some(canvas_ref.point_to_local_space(ui.cursor_position()));
+
+        ui.send(self.action_menu_search, TextMessage::Text(String::new()));
+        self.rebuild_action_menu_items(ui, "");
+
+        ui.send(self.action_menu, PopupMessage::Placement(Placement::Cursor(canvas)));
+        ui.send(self.action_menu, PopupMessage::Open);
+        ui.send(self.action_menu_search, WidgetMessage::Focus);
+    }
+
+    fn spawn_world_node_at(
+        &mut self,
+        ui: &mut UserInterface,
+        kind: BuiltinNodeKind,
+        graph_name: &str,
+        pos: fyrox::core::algebra::Vector2<f32>,
+    ) {
+        let mut n = Node::new(kind);
+        n.graph = graph_name.to_string();
+        n.position = [pos.x, pos.y];
+        let node_id = self.graph.add_node(n);
+
+        self.rebuild_all_graph_views(ui);
+        self.set_selected_node(ui, Some(node_id));
+    }
+
+    fn try_apply_pending_connection(&mut self, new_node_id: NodeId, graph_name: &str) {
+        let Some(pending) = self.pending_connection.take() else {
+            return;
+        };
+
+        if pending.graph_name != graph_name {
+            return;
+        }
+
+        let Some(new_node) = self.graph.nodes.get(&new_node_id) else {
+            return;
+        };
+
+        // Prefer conventional pin names for exec.
+        let mut target: Option<PinId> = None;
+        if pending.from_type == DataType::Exec {
+            let preferred = match pending.from_dir {
+                PinDirection::Output => "exec",
+                PinDirection::Input => "then",
+            };
+            if let Some(pin_id) = new_node.pin_named(preferred) {
+                if let Some(p) = self.graph.pin(pin_id) {
+                    let ty = self.get_actual_pin_type(pin_id).unwrap_or(p.data_type);
+                    if p.direction != pending.from_dir && ty == pending.from_type {
+                        target = Some(pin_id);
+                    }
+                }
+            }
+        }
+
+        if target.is_none() {
+            for pin in new_node.pins.iter() {
+                let Some(p) = self.graph.pin(pin.id) else {
+                    continue;
+                };
+                let ty = self.get_actual_pin_type(pin.id).unwrap_or(p.data_type);
+                if p.direction != pending.from_dir && ty == pending.from_type {
+                    target = Some(pin.id);
+                    break;
+                }
+            }
+        }
+
+        let Some(target) = target else {
+            return;
+        };
+
+        let (from, to) = match pending.from_dir {
+            PinDirection::Output => (pending.from, target),
+            PinDirection::Input => (target, pending.from),
+        };
+
+        let (Some(from_pin), Some(to_pin)) = (self.graph.pin(from), self.graph.pin(to)) else {
+            return;
+        };
+
+        let from_data_type = self.get_actual_pin_type(from).unwrap_or(from_pin.data_type);
+        let to_data_type = self.get_actual_pin_type(to).unwrap_or(to_pin.data_type);
+
+        if from_pin.direction != PinDirection::Output
+            || to_pin.direction != PinDirection::Input
+            || from_data_type != to_data_type
+        {
+            return;
+        }
+
+        // Mirror CommitConnection rules.
+        if from_data_type == DataType::Exec {
+            self.graph.links.retain(|l| l.to != to && l.from != from);
+        } else {
+            self.graph.links.retain(|l| l.to != to);
+        }
+
+        if !self.graph.links.iter().any(|l| l.from == from && l.to == to) {
+            self.graph.links.push(Link::exec(from, to));
         }
     }
 
@@ -527,8 +797,8 @@ impl BlueprintEditor {
         if let Some(path) = self.path.as_ref() {
             let title = path
                 .file_name()
-                .map(|n| format!("Blueprint - {}", n.to_string_lossy()))
-                .unwrap_or_else(|| "Blueprint".to_string());
+                .map(|n| format!("Blueprint [UX-2025-12-16] - {}", n.to_string_lossy()))
+                .unwrap_or_else(|| "Blueprint [UX-2025-12-16]".to_string());
 
             let ui = editor.engine.user_interfaces.first_mut();
             ui.send(
@@ -648,7 +918,7 @@ impl BlueprintEditor {
         let pin = self.graph.pin(pin_id)?;
         let node_id = self.graph.pin_owner(pin_id)?;
         let node = self.graph.nodes.get(&node_id)?;
-        
+
         // For variable nodes, determine type from the referenced variable
         match node.kind {
             BuiltinNodeKind::GetVariable | BuiltinNodeKind::SetVariable => {
@@ -800,12 +1070,28 @@ impl BlueprintEditor {
                     DataType::Unit => fyrox::core::color::Color::opaque(140, 140, 140),
                 };
 
+                let type_suffix = if pin.direction == PinDirection::Input
+                    && actual_data_type != DataType::Exec
+                {
+                    let ty = match actual_data_type {
+                        DataType::Bool => "bool",
+                        DataType::I32 => "int",
+                        DataType::F32 => "float",
+                        DataType::String => "string",
+                        DataType::Unit => "unit",
+                        DataType::Exec => "exec",
+                    };
+                    format!(" ({ty})")
+                } else {
+                    String::new()
+                };
+
                 let label = TextBuilder::new(
                     WidgetBuilder::new()
                         .with_margin(Thickness::left(4.0))
                         .with_height(18.0),
                 )
-                .with_text(pin.name.clone())
+                .with_text(format!("{}{}", pin.name, type_suffix))
                 .build(&mut ui.build_ctx());
 
                 // Unreal-style default value editor on the input pin row.
@@ -918,7 +1204,7 @@ impl BlueprintEditor {
                     label
                 };
 
-                let socket = SocketBuilder::new(WidgetBuilder::new().with_margin(Thickness::uniform(4.0)))
+                let socket = SocketBuilder::new(WidgetBuilder::new().with_margin(Thickness::uniform(2.0)))
                 .with_direction(match pin.direction {
                     fyrox_visual_scripting::PinDirection::Input => SocketDirection::Input,
                     fyrox_visual_scripting::PinDirection::Output => SocketDirection::Output,
@@ -946,6 +1232,7 @@ impl BlueprintEditor {
                 BuiltinNodeKind::Tick => "Tick",
                 BuiltinNodeKind::ConstructionScript => "Construction Script",
                 BuiltinNodeKind::Print => "Print",
+                BuiltinNodeKind::RhaiScript => "Rhai Script",
                 BuiltinNodeKind::Branch => "Branch",
                 BuiltinNodeKind::GetVariable => "GetVariable",
                 BuiltinNodeKind::SetVariable => "SetVariable",
@@ -968,7 +1255,7 @@ impl BlueprintEditor {
                     // Construction = dark blue
                     fyrox::core::color::Color::opaque(30, 80, 160)
                 }
-                BuiltinNodeKind::Print => {
+                BuiltinNodeKind::Print | BuiltinNodeKind::RhaiScript => {
                     // Utility/debug = cyan
                     fyrox::core::color::Color::opaque(40, 140, 160)
                 }
@@ -1004,6 +1291,10 @@ impl BlueprintEditor {
                 content_key = Some("name");
             }
 
+            if matches!(node.kind, BuiltinNodeKind::RhaiScript) {
+                content_key = Some("code");
+            }
+
             if let Some(key) = content_key {
                 let initial = node
                     .properties
@@ -1014,11 +1305,13 @@ impl BlueprintEditor {
                     })
                     .unwrap_or("");
 
+                let height = if key == "code" { 72.0 } else { 24.0 };
+
                 content = TextBoxBuilder::new(
                     WidgetBuilder::new()
                         .with_margin(Thickness::uniform(2.0))
                         .with_width(180.0)
-                        .with_height(24.0),
+                        .with_height(height),
                 )
                 .with_text(initial)
                 .build(&mut ui.build_ctx());
@@ -1357,6 +1650,44 @@ impl BlueprintEditor {
                 self.details_bindings
                     .insert(tb, DetailsBinding::NodeProp { node: node_id, key: "text" });
             }
+            BuiltinNodeKind::RhaiScript => {
+                let label = TextBuilder::new(
+                    WidgetBuilder::new().with_margin(Thickness::uniform(2.0)),
+                )
+                .with_text("Code")
+                .build(&mut ui.build_ctx());
+                ui.send(label, WidgetMessage::LinkWith(self.details_panel));
+                self.details_widgets.push(label);
+
+                let initial = node
+                    .properties
+                    .get("code")
+                    .and_then(|v| match v {
+                        Value::String(s) => Some(s.as_str()),
+                        _ => None,
+                    })
+                    .unwrap_or("");
+
+                let tb = TextBoxBuilder::new(
+                    WidgetBuilder::new()
+                        .with_margin(Thickness::uniform(2.0))
+                        .with_height(140.0),
+                )
+                .with_text(initial)
+                .build(&mut ui.build_ctx());
+                ui.send(tb, WidgetMessage::LinkWith(self.details_panel));
+                self.details_widgets.push(tb);
+                self.details_bindings
+                    .insert(tb, DetailsBinding::NodeProp { node: node_id, key: "code" });
+
+                let hint = TextBuilder::new(
+                    WidgetBuilder::new().with_margin(Thickness::uniform(2.0)),
+                )
+                .with_text("Use: get_var(name), set_var(name, value), dt(), print(text)")
+                .build(&mut ui.build_ctx());
+                ui.send(hint, WidgetMessage::LinkWith(self.details_panel));
+                self.details_widgets.push(hint);
+            }
             BuiltinNodeKind::GetVariable => {
                 let label = TextBuilder::new(
                     WidgetBuilder::new().with_margin(Thickness::uniform(2.0)),
@@ -1608,13 +1939,13 @@ impl BlueprintEditor {
     }
 
     fn spawn_world_node(&mut self, ui: &mut UserInterface, kind: BuiltinNodeKind) {
-        let mut n = Node::new(kind);
-        n.graph = self.active_graph_name().to_string();
-        n.position = [300.0, 200.0];
-        let node_id = self.graph.add_node(n);
-
-        self.rebuild_all_graph_views(ui);
-        self.set_selected_node(ui, Some(node_id));
+        let graph_name = self.active_graph_name().to_string();
+        self.spawn_world_node_at(
+            ui,
+            kind,
+            &graph_name,
+            fyrox::core::algebra::Vector2::new(300.0, 200.0),
+        );
     }
 
     fn sync_variable_node_pin_types(&mut self) {
@@ -1679,9 +2010,112 @@ impl BlueprintEditor {
     }
 
     fn handle_ui_message(&mut self, message: &UiMessage, engine: &mut Engine) {
+        // Right-click anywhere on a graph canvas (or its children) opens the Unreal-like action menu.
+        if let Some(WidgetMessage::MouseDown { button, .. }) = message.data() {
+            if *button == MouseButton::Right {
+                let ui = engine.user_interfaces.first_mut();
+
+                let dest = message.destination();
+                let canvas = ui
+                    .try_get_node(dest)
+                    .map(|n| {
+                        if n.has_component::<AbsmCanvas>() {
+                            dest
+                        } else {
+                            n.find_by_criteria_up(ui, |x| x.has_component::<AbsmCanvas>())
+                        }
+                    })
+                    .unwrap_or_default();
+
+                if canvas.is_some() {
+                    if canvas == self.event_view.canvas {
+                        self.pending_connection = None;
+                        self.open_action_menu(ui, canvas, tab_graph_name(BlueprintGraphTab::EventGraph).to_string());
+                        return;
+                    }
+                    if canvas == self.construction_view.canvas {
+                        self.pending_connection = None;
+                        self.open_action_menu(
+                            ui,
+                            canvas,
+                            tab_graph_name(BlueprintGraphTab::ConstructionScript).to_string(),
+                        );
+                        return;
+                    }
+                    if let Some(extra) = self.extra_tabs.iter().find(|t| t.view.canvas == canvas) {
+                        self.pending_connection = None;
+                        self.open_action_menu(ui, canvas, extra.name.clone());
+                        return;
+                    }
+                }
+            }
+        }
+
         if let Some(ButtonMessage::Click) = message.data() {
             if message.destination() == self.save {
                 self.save_to_disk(engine);
+            }
+
+            if let Some(action) = self
+                .action_menu_button_actions
+                .get(&message.destination())
+                .copied()
+            {
+                let ui = engine.user_interfaces.first_mut();
+                let graph_name = self
+                    .action_menu_spawn_graph
+                    .clone()
+                    .unwrap_or_else(|| self.active_graph_name().to_string());
+                let pos = self
+                    .action_menu_spawn_position
+                    .unwrap_or(fyrox::core::algebra::Vector2::new(300.0, 200.0));
+
+                let mut spawned: Option<NodeId> = None;
+
+                match action {
+                    ActionMenuAction::SpawnBuiltin(kind) => {
+                        let mut n = Node::new(kind);
+                        n.graph = graph_name.clone();
+                        n.position = [pos.x, pos.y];
+                        spawned = Some(self.graph.add_node(n));
+                    }
+                    ActionMenuAction::SpawnGetVariable(index) => {
+                        // Spawn at the action-menu position and graph.
+                        if let Some(var) = self.graph.variables.get(index).cloned() {
+                            let mut n = Node::new(BuiltinNodeKind::GetVariable);
+                            n.graph = graph_name.clone();
+                            n.position = [pos.x, pos.y];
+                            n.set_property_string("name", var.name);
+                            set_pin_data_type_by_name(&mut n, "value", var.data_type);
+                            spawned = Some(self.graph.add_node(n));
+                        }
+                    }
+                    ActionMenuAction::SpawnSetVariable(index) => {
+                        if let Some(var) = self.graph.variables.get(index).cloned() {
+                            let mut n = Node::new(BuiltinNodeKind::SetVariable);
+                            n.graph = graph_name.clone();
+                            n.position = [pos.x, pos.y];
+                            n.set_property_string("name", var.name);
+                            match var.data_type {
+                                DataType::Bool => n.set_property_bool("value", false),
+                                DataType::I32 => n.set_property_i32("value", 0),
+                                DataType::F32 => n.set_property_f32("value", 0.0),
+                                _ => n.set_property_string("value", String::new()),
+                            }
+                            set_pin_data_type_by_name(&mut n, "value", var.data_type);
+                            spawned = Some(self.graph.add_node(n));
+                        }
+                    }
+                }
+
+                if let Some(node_id) = spawned {
+                    self.try_apply_pending_connection(node_id, &graph_name);
+                    self.rebuild_all_graph_views(ui);
+                    self.set_selected_node(ui, Some(node_id));
+                }
+
+                ui.send(self.action_menu, PopupMessage::Close);
+                return;
             }
 
             if message.destination() == self.my_blueprint_new_graph {
@@ -1775,6 +2209,15 @@ impl BlueprintEditor {
                 self.spawn_world_node(ui, kind);
             }
             return;
+        }
+
+        if let Some(TextMessage::Text(text)) = message.data::<TextMessage>() {
+            if message.destination() == self.action_menu_search
+                && message.direction() == MessageDirection::FromWidget
+            {
+                let ui = engine.user_interfaces.first_mut();
+                self.rebuild_action_menu_items(ui, text);
+            }
         }
 
         if let Some(TabControlMessage::ActiveTab(Some(index))) = message.data() {
@@ -2034,6 +2477,39 @@ impl BlueprintEditor {
             return;
         }
 
+        if let Some(AbsmCanvasMessage::CommitConnectionToEmpty { source_socket }) =
+            message.data_from(view.canvas)
+        {
+            let canvas = view.canvas;
+            let graph_name = tab_graph_name(tab).to_string();
+
+            let Some(from_pin_id) = view.socket_to_pin.get(source_socket).copied() else {
+                Log::warn(
+                    "BlueprintEditor: CommitConnectionToEmpty rejected: unknown socket->pin mapping"
+                        .to_string(),
+                );
+                return;
+            };
+
+            let Some(from_pin) = self.graph.pin(from_pin_id) else {
+                return;
+            };
+
+            let from_type = self
+                .get_actual_pin_type(from_pin_id)
+                .unwrap_or(from_pin.data_type);
+
+            self.pending_connection = Some(PendingConnection {
+                from: from_pin_id,
+                from_dir: from_pin.direction,
+                from_type,
+                graph_name: graph_name.clone(),
+            });
+
+            self.open_action_menu(ui, canvas, graph_name);
+            return;
+        }
+
         // Inline node editors.
         if let Some(TextMessage::Text(text)) = message.data::<TextMessage>() {
             if let Some((node_id, key, ty)) = view.node_value_binding.get(&message.destination()) {
@@ -2202,6 +2678,43 @@ impl BlueprintEditor {
             }
 
             self.rebuild_all_graph_views(ui);
+            return true;
+        }
+
+        if let Some(AbsmCanvasMessage::CommitConnectionToEmpty { source_socket }) =
+            message.data_from(canvas)
+        {
+            let (from_pin_id, graph_name) = {
+                let view = &self.extra_tabs[extra_index].view;
+                (
+                    view.socket_to_pin.get(source_socket).copied(),
+                    self.extra_tabs[extra_index].name.clone(),
+                )
+            };
+
+            let Some(from_pin_id) = from_pin_id else {
+                Log::warn(
+                    "BlueprintEditor: CommitConnectionToEmpty rejected: unknown socket->pin mapping"
+                        .to_string(),
+                );
+                return true;
+            };
+
+            let Some(from_pin) = self.graph.pin(from_pin_id) else {
+                return true;
+            };
+
+            let from_type = self
+                .get_actual_pin_type(from_pin_id)
+                .unwrap_or(from_pin.data_type);
+
+            self.pending_connection = Some(PendingConnection {
+                from: from_pin_id,
+                from_dir: from_pin.direction,
+                from_type,
+                graph_name: graph_name.clone(),
+            });
+            self.open_action_menu(ui, canvas, graph_name);
             return true;
         }
 

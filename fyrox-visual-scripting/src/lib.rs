@@ -5,6 +5,7 @@ pub mod error;
 pub mod interpret;
 pub mod model;
 pub mod nodes;
+mod runtime;
 
 pub use crate::{
     compile::{compile, CompiledGraph},
@@ -131,5 +132,34 @@ mod tests {
             .events
             .iter()
             .any(|e| matches!(e, ExecutionEvent::Print(s) if s == "Hello from variable!")));
+    }
+
+    #[test]
+    fn rhai_script_prints() {
+        let mut graph = BlueprintGraph::new(GraphId("test".to_string()));
+
+        let begin_play = graph.add_node(Node::new(BuiltinNodeKind::BeginPlay));
+
+        let mut script = Node::new(BuiltinNodeKind::RhaiScript);
+        script.set_property_string("code", "print(\"Hello from Rhai\");".to_string());
+        let script_id = graph.add_node(script);
+
+        let begin_then = graph
+            .nodes
+            .get(&begin_play)
+            .unwrap()
+            .pin_named("then")
+            .unwrap();
+        let script_exec = graph.nodes.get(&script_id).unwrap().pin_named("exec").unwrap();
+        graph.add_link(Link::exec(begin_then, script_exec));
+
+        let compiled = compile(&graph).expect("compile");
+        let mut interpreter = Interpreter::new(compiled);
+        let out = interpreter.run_begin_play();
+
+        assert!(out
+            .events
+            .iter()
+            .any(|e| matches!(e, ExecutionEvent::Print(s) if s == "Hello from Rhai")));
     }
 }

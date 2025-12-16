@@ -7,18 +7,38 @@
 //! 3. Register it in the `NODE_REGISTRY`
 
 mod base;
-mod events;
-mod flow_control;
-mod utilities;
-mod variables;
-mod world;
+
+mod begin_play;
+mod branch;
+mod construction_script;
+mod get_actor_by_name;
+mod get_actor_name;
+mod get_actor_transform;
+mod get_variable;
+mod print;
+mod rhai_script;
+mod self_node;
+mod set_actor_transform;
+mod set_variable;
+mod spawn_actor;
+mod tick;
 
 pub use base::*;
-pub use events::*;
-pub use flow_control::*;
-pub use utilities::*;
-pub use variables::*;
-pub use world::*;
+
+pub use begin_play::*;
+pub use branch::*;
+pub use construction_script::*;
+pub use get_actor_by_name::*;
+pub use get_actor_name::*;
+pub use get_actor_transform::*;
+pub use get_variable::*;
+pub use print::*;
+pub use rhai_script::*;
+pub use self_node::*;
+pub use set_actor_transform::*;
+pub use set_variable::*;
+pub use spawn_actor::*;
+pub use tick::*;
 
 /// Registry of all available node definitions.
 /// Used by the editor to populate the node palette.
@@ -32,6 +52,7 @@ pub fn all_node_definitions() -> Vec<&'static dyn NodeDefinition> {
         &BranchNode,
         // Utilities
         &PrintNode,
+        &RhaiScriptNode,
         // Variables
         &GetVariableNode,
         &SetVariableNode,

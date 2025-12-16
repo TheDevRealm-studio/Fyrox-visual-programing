@@ -87,6 +87,7 @@ pub enum BuiltinNodeKind {
     Tick,
     ConstructionScript,
     Print,
+    RhaiScript,
     Branch,
     GetVariable,
     SetVariable,
@@ -131,6 +132,11 @@ impl Node {
         };
 
         node.pins = default_pins(kind);
+        const DEFAULT_RHAI_CODE: &str = "// Rhai snippet examples\n//\n// 1) Log\n// print(\"Hello from Rhai\");\n//\n// 2) Use variables\n// set_var(\"message\", \"Hello\");\n// print(get_var(\"message\"));\n//\n// 3) Read delta time during Tick\n// print(\"dt = \" + dt().to_string());\n";
+        if kind == BuiltinNodeKind::RhaiScript {
+            node.properties
+                .insert("code".to_string(), Value::String(DEFAULT_RHAI_CODE.to_string()));
+        }
         node
     }
 
@@ -216,6 +222,26 @@ fn default_pins(kind: BuiltinNodeKind) -> Vec<Pin> {
             Pin {
                 id: PinId(2),
                 name: "text".to_string(),
+                direction: D::Input,
+                data_type: T::String,
+            },
+        ],
+        K::RhaiScript => vec![
+            Pin {
+                id: PinId(0),
+                name: "exec".to_string(),
+                direction: D::Input,
+                data_type: T::Exec,
+            },
+            Pin {
+                id: PinId(1),
+                name: "then".to_string(),
+                direction: D::Output,
+                data_type: T::Exec,
+            },
+            Pin {
+                id: PinId(2),
+                name: "code".to_string(),
                 direction: D::Input,
                 data_type: T::String,
             },
@@ -362,13 +388,25 @@ fn default_pins(kind: BuiltinNodeKind) -> Vec<Pin> {
         ],
         K::GetActorByName => vec![
             Pin {
-                id: PinId(0),
+                id: PinId(1),
+                name: "exec".to_string(),
+                direction: D::Input,
+                data_type: T::Exec,
+            },
+            Pin {
+                id: PinId(2),
+                name: "then".to_string(),
+                direction: D::Output,
+                data_type: T::Exec,
+            },
+            Pin {
+                id: PinId(3),
                 name: "name".to_string(),
                 direction: D::Input,
                 data_type: T::String,
             },
             Pin {
-                id: PinId(1),
+                id: PinId(4),
                 name: "actor".to_string(),
                 direction: D::Output,
                 data_type: T::String,

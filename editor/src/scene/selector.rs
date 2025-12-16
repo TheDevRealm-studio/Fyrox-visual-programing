@@ -147,7 +147,11 @@ impl HierarchyNode {
         )
         .with_content(
             TextBuilder::new(WidgetBuilder::new().with_foreground(brush))
-                .with_text(make_node_name(&self.name, self.handle) + " - " + &self.inner_type_name)
+                .with_text(format!(
+                    "{} - {}",
+                    make_node_name(&self.name, self.handle),
+                    self.inner_type_name
+                ))
                 .build(ctx),
         )
         .build(ctx)
@@ -613,13 +617,14 @@ impl NodeSelectorWindowBuilder {
                             .with_margin(Thickness::uniform(2.0)),
                     )
                     .with_text(
-                        "Select a node of the following type(s):\n".to_string()
-                            + &self
-                                .allowed_types
+                        format!(
+                            "Select a node of the following type(s):\n{}",
+                            self.allowed_types
                                 .iter()
                                 .map(|ty| ty.name.clone())
                                 .collect::<Vec<_>>()
-                                .join("\n"),
+                                .join("\n")
+                        ),
                     )
                     .with_wrap(WrapMode::Letter)
                     .build(ctx),
