@@ -20,8 +20,8 @@
 
 use crate::fyrox::{
     core::{
-        color::Color, pool::Handle, reflect::prelude::*, type_traits::prelude::*, uuid::uuid,
-        visitor::prelude::*,
+        algebra::Vector2, color::Color, pool::Handle, reflect::prelude::*, type_traits::prelude::*,
+        uuid::uuid, visitor::prelude::*,
     },
     graph::BaseSceneGraph,
     gui::{
@@ -61,6 +61,7 @@ where
 {
     widget: Widget,
     background: Handle<UiNode>,
+    layout: AbsmNodeLayout,
     #[component(include)]
     selectable: Selectable,
     pub name_value: String,
@@ -76,7 +77,7 @@ where
     edit: Handle<UiNode>,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Visit, Reflect)]
 pub enum AbsmNodeLayout {
     Classic,
     BlueprintCompact,
@@ -96,6 +97,7 @@ where
         Self {
             widget: self.widget.clone(),
             background: self.background,
+            layout: self.layout,
             selectable: self.selectable.clone(),
             name_value: self.name_value.clone(),
             model_handle: self.model_handle,
@@ -136,14 +138,29 @@ where
     T: Reflect,
 {
     fn update_colors(&self, ui: &UserInterface) {
-        ui.send(
-            self.background,
-            WidgetMessage::Background(if self.selectable.selected {
-                self.selected_brush.clone()
-            } else {
-                self.normal_brush.clone()
-            }),
-        );
+        match self.layout {
+            AbsmNodeLayout::Classic => {
+                ui.send(
+                    self.background,
+                    WidgetMessage::Background(if self.selectable.selected {
+                        self.selected_brush.clone()
+                    } else {
+                        self.normal_brush.clone()
+                    }),
+                );
+            }
+            AbsmNodeLayout::BlueprintCompact => {
+                // Unreal-like: selection is an outline highlight.
+                ui.send(
+                    self.background,
+                    WidgetMessage::Foreground(if self.selectable.selected {
+                        self.selected_brush.clone()
+                    } else {
+                        self.normal_brush.clone()
+                    }),
+                );
+            }
+        }
     }
 }
 
@@ -375,7 +392,8 @@ where
         let mut edit = Handle::NONE;
         let content = self.content;
 
-        let (grid2, corner_radius) = match self.layout {
+        let layout = self.layout;
+        let (grid2, corner_radius) = match layout {
             AbsmNodeLayout::Classic => {
                 let grid = GridBuilder::new(
                     WidgetBuilder::new()
@@ -517,9 +535,9 @@ where
                     WidgetBuilder::new()
                         .with_margin(Thickness {
                             left: 6.0,
-                            top: 0.0,
+                            top: 2.0,
                             right: 6.0,
-                            bottom: 0.0,
+                            bottom: 2.0,
                         })
                         .with_vertical_alignment(VerticalAlignment::Center),
                 )
@@ -539,7 +557,8 @@ where
 
                 let header = BorderBuilder::new(
                     WidgetBuilder::new()
-                        .with_height(24.0)
+                        .on_row(0)
+                        .with_height(28.0)
                         .with_background(header_brush)
                         .with_child(name),
                 )
@@ -550,7 +569,7 @@ where
                 input_sockets_panel = StackPanelBuilder::new(
                     WidgetBuilder::new()
                         .with_margin(Thickness::uniform(2.0))
-                        .with_vertical_alignment(VerticalAlignment::Center)
+                        .with_vertical_alignment(VerticalAlignment::Top)
                         .with_children(self.input_sockets.iter().cloned())
                         .on_column(0),
                 )
@@ -567,7 +586,7 @@ where
                 let output_panel = StackPanelBuilder::new(
                     WidgetBuilder::new()
                         .with_margin(Thickness::uniform(2.0))
-                        .with_vertical_alignment(VerticalAlignment::Center)
+                        .with_vertical_alignment(VerticalAlignment::Top)
                         .with_children(self.output_sockets.iter().cloned())
                         .on_column(2),
                 )
@@ -578,11 +597,13 @@ where
                 // Dark body background (Unreal-like).
                 let body = BorderBuilder::new(
                     WidgetBuilder::new()
+                        .on_row(1)
+                        .with_min_size(Vector2::new(220.0, 28.0))
                         .with_background(Brush::Solid(Color::opaque(40, 40, 40)).into())
                         .with_child(
                             GridBuilder::new(
                                 WidgetBuilder::new()
-                                    .with_margin(Thickness::uniform(2.0))
+                                    .with_margin(Thickness::uniform(4.0))
                                     .with_child(input_sockets_panel)
                                     .with_child(center)
                                     .with_child(output_panel),
@@ -616,19 +637,33 @@ where
             .selected_brush
             .unwrap_or_else(|| ctx.style.property(Style::BRUSH_LIGHTER));
 
-        let background = BorderBuilder::new(
-            WidgetBuilder::new()
-                .with_foreground(ctx.style.property(Style::BRUSH_LIGHT))
-                .with_background(normal_brush.clone())
-                .with_child(grid2),
-        )
-        .with_pad_by_corner_radius(false)
-        .with_corner_radius(corner_radius.into())
-        .build(ctx);
+        let background = match layout {
+            AbsmNodeLayout::Classic => BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_foreground(ctx.style.property(Style::BRUSH_LIGHT))
+                    .with_background(normal_brush.clone())
+                    .with_child(grid2),
+            )
+            .with_pad_by_corner_radius(false)
+            .with_corner_radius(corner_radius.into())
+            .build(ctx),
+            AbsmNodeLayout::BlueprintCompact => BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_min_size(Vector2::new(220.0, 56.0))
+                    .with_background(Brush::Solid(Color::opaque(32, 32, 32)).into())
+                    .with_foreground(normal_brush.clone())
+                    .with_child(grid2),
+            )
+            .with_pad_by_corner_radius(false)
+            .with_corner_radius(corner_radius.into())
+            .with_stroke_thickness(Thickness::uniform(1.0).into())
+            .build(ctx),
+        };
 
         let node = AbsmNode {
             widget: self.widget_builder.with_child(background).build(ctx),
             background,
+            layout,
             selectable: Default::default(),
             model_handle: self.model_handle,
             name_value: self.name,

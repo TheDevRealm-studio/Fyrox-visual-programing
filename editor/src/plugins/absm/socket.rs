@@ -71,6 +71,7 @@ pub struct Socket {
 define_widget_deref!(Socket);
 
 const RADIUS: f32 = 6.0;
+const PIN_SIZE: f32 = RADIUS * 2.0;
 
 uuid_provider!(Socket = "a6c0473e-7073-4e91-a681-cf88795af52a");
 
@@ -202,6 +203,8 @@ impl SocketBuilder {
                         WidgetBuilder::new()
                             .on_row(0)
                             .on_column(0)
+                            .with_width(PIN_SIZE)
+                            .with_height(PIN_SIZE)
                             .with_foreground(pin_foreground),
                     )
                     .with_primitives(vec![Primitive::Circle {
@@ -248,7 +251,11 @@ impl SocketBuilder {
         };
 
         let socket = Socket {
-            widget: self.widget_builder.with_child(grid).build(ctx),
+            widget: self
+                .widget_builder
+                .with_min_size(Vector2::new(0.0, PIN_SIZE + 4.0))
+                .with_child(grid)
+                .build(ctx),
             click_position: Default::default(),
             parent_node: self.parent_node,
             direction: self.direction,

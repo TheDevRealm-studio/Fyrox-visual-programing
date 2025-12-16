@@ -689,7 +689,7 @@ impl BlueprintEditor {
                 let label = TextBuilder::new(
                     WidgetBuilder::new()
                         .with_margin(Thickness::left(4.0))
-                        .with_height(16.0),
+                        .with_height(18.0),
                 )
                 .with_text(pin.name.clone())
                 .build(&mut ui.build_ctx());
