@@ -80,6 +80,7 @@ fn create_socket<N: Reflect>(
     index: usize,
     show_index: bool,
     parent_node: Handle<PoseNode<Handle<N>>>,
+    canvas: Handle<UiNode>,
     ui: &mut UserInterface,
 ) -> Handle<UiNode> {
     SocketBuilder::new(WidgetBuilder::new().with_margin(Thickness::uniform(2.0)))
@@ -87,6 +88,7 @@ fn create_socket<N: Reflect>(
         .with_parent_node(parent_node.into())
         .with_index(index)
         .with_show_index(show_index)
+        .with_canvas(canvas)
         .build(&mut ui.build_ctx())
 }
 
@@ -94,10 +96,11 @@ fn create_sockets<N: Reflect>(
     count: usize,
     direction: SocketDirection,
     parent_node: Handle<PoseNode<Handle<N>>>,
+    canvas: Handle<UiNode>,
     ui: &mut UserInterface,
 ) -> Vec<Handle<UiNode>> {
     (0..count)
-        .map(|index| create_socket(direction, index, true, parent_node, ui))
+        .map(|index| create_socket(direction, index, true, parent_node, canvas, ui))
         .collect::<Vec<_>>()
 }
 
@@ -517,6 +520,7 @@ impl StateViewer {
                                 input_socket_count,
                                 SocketDirection::Input,
                                 pose_definition,
+                                self.canvas,
                                 ui,
                             ))
                             .with_output_socket(create_socket(
@@ -524,6 +528,7 @@ impl StateViewer {
                                 0,
                                 false,
                                 pose_definition,
+                                self.canvas,
                                 ui,
                             ))
                             .with_normal_brush(if pose_definition == parent_state_ref.root {
@@ -590,6 +595,7 @@ impl StateViewer {
                         children.len(),
                         SocketDirection::Input,
                         view_ref.model_handle,
+                        self.canvas,
                         ui,
                     );
                     ui.send_sync(view, AbsmNodeMessage::InputSockets(input_sockets));

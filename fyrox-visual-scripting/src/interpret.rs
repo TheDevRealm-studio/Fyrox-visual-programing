@@ -148,7 +148,13 @@ impl Interpreter {
                 BuiltinNodeKind::BeginPlay
                 | BuiltinNodeKind::ConstructionScript
                 | BuiltinNodeKind::Tick
-                | BuiltinNodeKind::GetVariable => {
+                | BuiltinNodeKind::GetVariable
+                | BuiltinNodeKind::Self_
+                | BuiltinNodeKind::GetActorTransform
+                | BuiltinNodeKind::SetActorTransform
+                | BuiltinNodeKind::SpawnActor
+                | BuiltinNodeKind::GetActorByName
+                | BuiltinNodeKind::GetActorName => {
                     next_exec_in_pin = self.next_exec(node_id, "then");
                 }
             }

@@ -54,7 +54,29 @@ pub fn compile(graph: &BlueprintGraph) -> Result<CompiledGraph, CompileError> {
     for (node_id, node) in graph.nodes.iter() {
         let mut pins = BTreeMap::new();
         for pin in node.pins.iter() {
-            pins.insert(pin.name.clone(), (pin.id, pin.direction, pin.data_type));
+            // Dynamically adjust pin types for variable nodes based on the actual variable type
+            let actual_data_type = match node.kind {
+                BuiltinNodeKind::GetVariable | BuiltinNodeKind::SetVariable => {
+                    if pin.name == "value" {
+                        // Look up the variable's actual type
+                        node.properties
+                            .get("name")
+                            .and_then(|v| match v {
+                                Value::String(var_name) => graph
+                                    .variables
+                                    .iter()
+                                    .find(|var| var.name == *var_name)
+                                    .map(|var| var.data_type),
+                                _ => None,
+                            })
+                            .unwrap_or(pin.data_type)
+                    } else {
+                        pin.data_type
+                    }
+                }
+                _ => pin.data_type,
+            };
+            pins.insert(pin.name.clone(), (pin.id, pin.direction, actual_data_type));
         }
         nodes.insert(
             *node_id,
@@ -101,6 +123,35 @@ fn find_entry(graph: &BlueprintGraph, kind: BuiltinNodeKind) -> Option<NodeId> {
         .nodes
         .iter()
         .find_map(|(id, n)| (n.kind == kind).then_some(*id))
+}
+
+/// Get the actual data type of a pin, considering dynamic typing for variable nodes
+fn get_actual_pin_type(graph: &BlueprintGraph, pin_id: PinId) -> Option<DataType> {
+    let pin = graph.pin(pin_id)?;
+    let node_id = graph.pin_owner(pin_id)?;
+    let node = graph.nodes.get(&node_id)?;
+    
+    // For variable nodes, determine type from the referenced variable
+    match node.kind {
+        BuiltinNodeKind::GetVariable | BuiltinNodeKind::SetVariable => {
+            if pin.name == "value" {
+                node.properties
+                    .get("name")
+                    .and_then(|v| match v {
+                        Value::String(var_name) => graph
+                            .variables
+                            .iter()
+                            .find(|var| var.name == *var_name)
+                            .map(|var| var.data_type),
+                        _ => None,
+                    })
+                    .or(Some(pin.data_type))
+            } else {
+                Some(pin.data_type)
+            }
+        }
+        _ => Some(pin.data_type),
+    }
 }
 
 fn validate(graph: &BlueprintGraph) -> Result<(), CompileError> {
@@ -152,7 +203,11 @@ fn validate(graph: &BlueprintGraph) -> Result<(), CompileError> {
                 .with_pin(*to));
         }
 
-        if from_pin.data_type != to_pin.data_type {
+        // Use actual types (considering dynamic typing for variable nodes)
+        let from_type = get_actual_pin_type(graph, *from).unwrap_or(from_pin.data_type);
+        let to_type = get_actual_pin_type(graph, *to).unwrap_or(to_pin.data_type);
+
+        if from_type != to_type {
             return Err(CompileError::new(ValidationError::TypeMismatch)
                 .with_pin(*from)
                 .with_pin(*to));

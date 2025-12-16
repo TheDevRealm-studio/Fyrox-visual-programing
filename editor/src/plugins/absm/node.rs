@@ -530,14 +530,15 @@ where
                 (grid2, 12.0)
             }
             AbsmNodeLayout::BlueprintCompact => {
-                // Header text (node name) + body (pin columns + optional content).
+                // Unreal-like node: colored header bar + dark translucent body.
+                // Header text (node name).
                 name = TextBuilder::new(
                     WidgetBuilder::new()
                         .with_margin(Thickness {
-                            left: 6.0,
-                            top: 2.0,
-                            right: 6.0,
-                            bottom: 2.0,
+                            left: 10.0,
+                            top: 5.0,
+                            right: 10.0,
+                            bottom: 5.0,
                         })
                         .with_vertical_alignment(VerticalAlignment::Center),
                 )
@@ -555,20 +556,28 @@ where
                     .clone()
                     .unwrap_or_else(|| ctx.style.property(Style::BRUSH_DARKER));
 
+                // Header with rounded top corners only (Unreal-like).
                 let header = BorderBuilder::new(
                     WidgetBuilder::new()
                         .on_row(0)
-                        .with_height(28.0)
+                        .with_height(32.0)
                         .with_background(header_brush)
                         .with_child(name),
                 )
                 .with_pad_by_corner_radius(false)
+                .with_corner_radius(6.0.into())
                 .with_stroke_thickness(Thickness::zero().into())
                 .build(ctx);
 
+                // Input sockets panel (left side).
                 input_sockets_panel = StackPanelBuilder::new(
                     WidgetBuilder::new()
-                        .with_margin(Thickness::uniform(2.0))
+                        .with_margin(Thickness {
+                            left: 0.0,
+                            top: 10.0,
+                            right: 10.0,
+                            bottom: 10.0,
+                        })
                         .with_vertical_alignment(VerticalAlignment::Top)
                         .with_children(self.input_sockets.iter().cloned())
                         .on_column(0),
@@ -583,32 +592,39 @@ where
                 .with_text("+Input")
                 .build(ctx);
 
+                // Output sockets panel (right side).
                 let output_panel = StackPanelBuilder::new(
                     WidgetBuilder::new()
-                        .with_margin(Thickness::uniform(2.0))
+                        .with_margin(Thickness {
+                            left: 10.0,
+                            top: 10.0,
+                            right: 0.0,
+                            bottom: 10.0,
+                        })
                         .with_vertical_alignment(VerticalAlignment::Top)
                         .with_children(self.output_sockets.iter().cloned())
                         .on_column(2),
                 )
                 .build(ctx);
 
+                // Center content (e.g., text box for Print node).
                 let center = content.unwrap_or_default();
 
-                // Dark body background (Unreal-like).
+                // Body with dark semi-transparent background (Unreal-like).
                 let body = BorderBuilder::new(
                     WidgetBuilder::new()
                         .on_row(1)
-                        .with_min_size(Vector2::new(220.0, 28.0))
-                        .with_background(Brush::Solid(Color::opaque(40, 40, 40)).into())
+                        .with_min_size(Vector2::new(220.0, 40.0))
+                        .with_background(Brush::Solid(Color::opaque(45, 45, 45)).into())
                         .with_child(
                             GridBuilder::new(
                                 WidgetBuilder::new()
-                                    .with_margin(Thickness::uniform(4.0))
+                                    .with_margin(Thickness::uniform(6.0))
                                     .with_child(input_sockets_panel)
                                     .with_child(center)
                                     .with_child(output_panel),
                             )
-                            .add_row(Row::auto())
+                            .add_row(Row::stretch())
                             .add_column(Column::auto())
                             .add_column(Column::stretch())
                             .add_column(Column::auto())
@@ -616,12 +632,13 @@ where
                         ),
                 )
                 .with_pad_by_corner_radius(false)
+                .with_corner_radius(0.0.into())
                 .with_stroke_thickness(Thickness::zero().into())
                 .build(ctx);
 
                 let grid2 = GridBuilder::new(WidgetBuilder::new().with_child(header).with_child(body))
                     .add_row(Row::auto())
-                    .add_row(Row::auto())
+                    .add_row(Row::stretch())
                     .add_column(Column::stretch())
                     .build(ctx);
 
@@ -649,7 +666,7 @@ where
             .build(ctx),
             AbsmNodeLayout::BlueprintCompact => BorderBuilder::new(
                 WidgetBuilder::new()
-                    .with_min_size(Vector2::new(220.0, 56.0))
+                    .with_min_size(Vector2::new(240.0, 64.0))
                     .with_background(Brush::Solid(Color::opaque(32, 32, 32)).into())
                     .with_foreground(normal_brush.clone())
                     .with_child(grid2),

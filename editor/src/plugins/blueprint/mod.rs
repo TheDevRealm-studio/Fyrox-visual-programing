@@ -13,11 +13,13 @@ use crate::{
         engine::Engine,
         graph::BaseSceneGraph,
         gui::{
+            check_box::{CheckBoxBuilder, CheckBoxMessage},
             button::{ButtonBuilder, ButtonMessage},
             dock::{DockingManagerBuilder, DockingManagerMessage, TileBuilder, TileContent},
             dropdown_list::{DropdownListBuilder, DropdownListMessage},
             grid::{Column, GridBuilder, Row},
             message::UiMessage,
+            numeric::{NumericUpDownBuilder, NumericUpDownMessage},
             scroll_viewer::ScrollViewerBuilder,
             stack_panel::StackPanelBuilder,
             tab_control::{TabControlBuilder, TabControlMessage, TabDefinition},
@@ -46,8 +48,7 @@ use std::{
 };
 
 use crate::plugins::absm::{
-    canvas::AbsmCanvasBuilder,
-    canvas::AbsmCanvasMessage,
+    canvas::{AbsmCanvas, AbsmCanvasBuilder, AbsmCanvasMessage},
     connection::ConnectionBuilder,
     node::{AbsmNodeBuilder, AbsmNodeLayout},
     socket::{Socket, SocketBuilder, SocketDirection},
@@ -82,6 +83,7 @@ struct GraphView {
     pin_to_node: HashMap<PinId, NodeId>,
     node_primary_text_box_by_node: HashMap<NodeId, Handle<UiNode>>,
     node_text_box_binding: HashMap<Handle<UiNode>, (NodeId, String)>,
+    node_value_binding: HashMap<Handle<UiNode>, (NodeId, String, DataType)>,
     connection_views: Vec<Handle<UiNode>>,
     node_view_handles: Vec<Handle<UiNode>>,
 }
@@ -98,6 +100,7 @@ impl GraphView {
             pin_to_node: HashMap::new(),
             node_primary_text_box_by_node: HashMap::new(),
             node_text_box_binding: HashMap::new(),
+            node_value_binding: HashMap::new(),
             connection_views: Vec::new(),
             node_view_handles: Vec::new(),
         }
@@ -121,6 +124,7 @@ impl GraphView {
         self.pin_to_node.clear();
         self.node_primary_text_box_by_node.clear();
         self.node_text_box_binding.clear();
+        self.node_value_binding.clear();
         self.connection_views.clear();
         self.node_view_handles.clear();
     }
@@ -162,6 +166,8 @@ struct BlueprintEditor {
     selected_node: Option<NodeId>,
     selected_variable: Option<usize>,
 
+    node_palette_buttons: HashMap<Handle<UiNode>, BuiltinNodeKind>,
+
     active_tab: BlueprintGraphTab,
     active_extra_tab: Option<usize>,
 
@@ -192,6 +198,8 @@ impl BlueprintEditor {
 
     fn new(engine: &mut Engine) -> Self {
         let ctx = &mut engine.user_interfaces.first_mut().build_ctx();
+
+        let mut node_palette_buttons = HashMap::new();
 
         let save;
         let my_blueprint_graphs_event;
@@ -303,6 +311,53 @@ impl BlueprintEditor {
                         })
                         .with_child(
                             TextBuilder::new(WidgetBuilder::new().with_margin(Thickness::uniform(6.0)))
+                                .with_text("WORLD NODES")
+                                .build(ctx),
+                        )
+                        .with_child({
+                            let b = ButtonBuilder::new(WidgetBuilder::new().with_height(24.0))
+                                .with_text("Self")
+                                .build(ctx);
+                            node_palette_buttons.insert(b, BuiltinNodeKind::Self_);
+                            b
+                        })
+                        .with_child({
+                            let b = ButtonBuilder::new(WidgetBuilder::new().with_height(24.0))
+                                .with_text("Get Actor Transform")
+                                .build(ctx);
+                            node_palette_buttons.insert(b, BuiltinNodeKind::GetActorTransform);
+                            b
+                        })
+                        .with_child({
+                            let b = ButtonBuilder::new(WidgetBuilder::new().with_height(24.0))
+                                .with_text("Set Actor Transform")
+                                .build(ctx);
+                            node_palette_buttons.insert(b, BuiltinNodeKind::SetActorTransform);
+                            b
+                        })
+                        .with_child({
+                            let b = ButtonBuilder::new(WidgetBuilder::new().with_height(24.0))
+                                .with_text("Spawn Actor")
+                                .build(ctx);
+                            node_palette_buttons.insert(b, BuiltinNodeKind::SpawnActor);
+                            b
+                        })
+                        .with_child({
+                            let b = ButtonBuilder::new(WidgetBuilder::new().with_height(24.0))
+                                .with_text("Get Actor By Name")
+                                .build(ctx);
+                            node_palette_buttons.insert(b, BuiltinNodeKind::GetActorByName);
+                            b
+                        })
+                        .with_child({
+                            let b = ButtonBuilder::new(WidgetBuilder::new().with_height(24.0))
+                                .with_text("Get Actor Name")
+                                .build(ctx);
+                            node_palette_buttons.insert(b, BuiltinNodeKind::GetActorName);
+                            b
+                        })
+                        .with_child(
+                            TextBuilder::new(WidgetBuilder::new().with_margin(Thickness::uniform(6.0)))
                                 .with_text("FUNCTIONS")
                                 .build(ctx),
                         )
@@ -328,8 +383,10 @@ impl BlueprintEditor {
             )
             .build(ctx);
 
-        event_canvas = AbsmCanvasBuilder::new(WidgetBuilder::new()).build(ctx);
-        construction_canvas = AbsmCanvasBuilder::new(WidgetBuilder::new()).build(ctx);
+        event_canvas =
+            AbsmCanvasBuilder::new(WidgetBuilder::new().with_allow_drop(true)).build(ctx);
+        construction_canvas =
+            AbsmCanvasBuilder::new(WidgetBuilder::new().with_allow_drop(true)).build(ctx);
 
         tab_control = TabControlBuilder::new(WidgetBuilder::new())
             .with_tab(make_tab("Event Graph", event_canvas, ctx))
@@ -438,6 +495,8 @@ impl BlueprintEditor {
             details_bindings: HashMap::new(),
             selected_node: None,
             selected_variable: None,
+
+            node_palette_buttons,
 
             active_tab: BlueprintGraphTab::EventGraph,
             active_extra_tab: None,
@@ -584,6 +643,36 @@ impl BlueprintEditor {
         self.graph.links.push(Link::exec(then, exec));
     }
 
+    /// Get the actual data type of a pin, considering dynamic typing for variable nodes
+    fn get_actual_pin_type(&self, pin_id: PinId) -> Option<DataType> {
+        let pin = self.graph.pin(pin_id)?;
+        let node_id = self.graph.pin_owner(pin_id)?;
+        let node = self.graph.nodes.get(&node_id)?;
+        
+        // For variable nodes, determine type from the referenced variable
+        match node.kind {
+            BuiltinNodeKind::GetVariable | BuiltinNodeKind::SetVariable => {
+                if pin.name == "value" {
+                    node.properties
+                        .get("name")
+                        .and_then(|v| match v {
+                            Value::String(var_name) => self
+                                .graph
+                                .variables
+                                .iter()
+                                .find(|var| var.name == *var_name)
+                                .map(|var| var.data_type),
+                            _ => None,
+                        })
+                        .or(Some(pin.data_type))
+                } else {
+                    Some(pin.data_type)
+                }
+            }
+            _ => Some(pin.data_type),
+        }
+    }
+
     fn rebuild_all_graph_views(&mut self, ui: &mut UserInterface) {
         let pin_owner = self.pin_owner_map();
         let event_visible = self.visible_nodes(BlueprintGraphTab::EventGraph);
@@ -652,6 +741,29 @@ impl BlueprintEditor {
     ) {
         view.clear_ui(ui);
 
+        let actual_pin_type = |node: &Node, pin: &fyrox_visual_scripting::Pin| -> DataType {
+            match node.kind {
+                BuiltinNodeKind::GetVariable | BuiltinNodeKind::SetVariable => {
+                    if pin.name == "value" {
+                        node.properties
+                            .get("name")
+                            .and_then(|v| match v {
+                                Value::String(var_name) => graph
+                                    .variables
+                                    .iter()
+                                    .find(|var| var.name == *var_name)
+                                    .map(|var| var.data_type),
+                                _ => None,
+                            })
+                            .unwrap_or(pin.data_type)
+                    } else {
+                        pin.data_type
+                    }
+                }
+                _ => pin.data_type,
+            }
+        };
+
         // Create node views.
         for (node_id, node) in graph.nodes.iter() {
             if !visible_nodes.contains(node_id) {
@@ -676,8 +788,10 @@ impl BlueprintEditor {
             });
 
             for pin in pins {
+                let actual_data_type = actual_pin_type(node, pin);
+
                 // Unreal-like pin colors based on data type.
-                let pin_color = match pin.data_type {
+                let pin_color = match actual_data_type {
                     DataType::Exec => fyrox::core::color::Color::WHITE,
                     DataType::Bool => fyrox::core::color::Color::opaque(200, 70, 70),
                     DataType::I32 => fyrox::core::color::Color::opaque(60, 200, 220),
@@ -694,16 +808,127 @@ impl BlueprintEditor {
                 .with_text(pin.name.clone())
                 .build(&mut ui.build_ctx());
 
-                let socket = SocketBuilder::new(WidgetBuilder::new().with_margin(Thickness::uniform(2.0)))
+                // Unreal-style default value editor on the input pin row.
+                let editor = if pin.direction == PinDirection::Input && actual_data_type != DataType::Exec {
+                    let is_connected = graph.links.iter().any(|l| l.to == pin.id);
+
+                    if is_connected {
+                        // When linked, UE hides the default value editor.
+                        label
+                    } else {
+                        let mut row = WidgetBuilder::new()
+                            .with_horizontal_alignment(HorizontalAlignment::Stretch)
+                            .with_child(label)
+                            .with_margin(Thickness::uniform(0.0));
+
+                        let key = pin.name.clone();
+                        let value_widget: Handle<UiNode> = match actual_data_type {
+                            DataType::String => {
+                                let initial = node
+                                    .properties
+                                    .get(&key)
+                                    .and_then(|v| match v {
+                                        Value::String(s) => Some(s.as_str()),
+                                        _ => None,
+                                    })
+                                    .unwrap_or("");
+
+                                TextBoxBuilder::new(
+                                    WidgetBuilder::new()
+                                        .with_margin(Thickness::left(6.0))
+                                        .with_height(22.0)
+                                        .with_width(140.0)
+                                        .with_horizontal_alignment(HorizontalAlignment::Stretch),
+                                )
+                                .with_text(initial)
+                                .build(&mut ui.build_ctx())
+                            }
+                            DataType::Bool => {
+                                let initial = node
+                                    .properties
+                                    .get(&key)
+                                    .and_then(|v| match v {
+                                        Value::Bool(b) => Some(*b),
+                                        _ => None,
+                                    })
+                                    .unwrap_or(false);
+
+                                CheckBoxBuilder::new(
+                                    WidgetBuilder::new()
+                                        .with_margin(Thickness::left(6.0))
+                                        .with_height(18.0),
+                                )
+                                .checked(Some(initial))
+                                .build(&mut ui.build_ctx())
+                            }
+                            DataType::I32 => {
+                                let initial = node
+                                    .properties
+                                    .get(&key)
+                                    .and_then(|v| match v {
+                                        Value::I32(x) => Some(*x),
+                                        _ => None,
+                                    })
+                                    .unwrap_or(0);
+
+                                NumericUpDownBuilder::<i32>::new(
+                                    WidgetBuilder::new()
+                                        .with_margin(Thickness::left(6.0))
+                                        .with_height(22.0)
+                                        .with_width(120.0)
+                                        .with_horizontal_alignment(HorizontalAlignment::Stretch),
+                                )
+                                .with_value(initial)
+                                .build(&mut ui.build_ctx())
+                            }
+                            DataType::F32 => {
+                                let initial = node
+                                    .properties
+                                    .get(&key)
+                                    .and_then(|v| match v {
+                                        Value::F32(x) => Some(*x),
+                                        _ => None,
+                                    })
+                                    .unwrap_or(0.0);
+
+                                NumericUpDownBuilder::<f32>::new(
+                                    WidgetBuilder::new()
+                                        .with_margin(Thickness::left(6.0))
+                                        .with_height(22.0)
+                                        .with_width(120.0)
+                                        .with_horizontal_alignment(HorizontalAlignment::Stretch),
+                                )
+                                .with_value(initial)
+                                .build(&mut ui.build_ctx())
+                            }
+                            _ => Handle::NONE,
+                        };
+
+                        if value_widget != Handle::NONE {
+                            row = row.with_child(value_widget);
+                            view.node_value_binding
+                                .insert(value_widget, (*node_id, key, actual_data_type));
+                        }
+
+                        StackPanelBuilder::new(row)
+                            .with_orientation(Orientation::Horizontal)
+                            .build(&mut ui.build_ctx())
+                    }
+                } else {
+                    label
+                };
+
+                let socket = SocketBuilder::new(WidgetBuilder::new().with_margin(Thickness::uniform(4.0)))
                 .with_direction(match pin.direction {
                     fyrox_visual_scripting::PinDirection::Input => SocketDirection::Input,
                     fyrox_visual_scripting::PinDirection::Output => SocketDirection::Output,
                 })
                 .with_parent_node(ErasedHandle::from(model_handle))
-                .with_editor(label)
+                .with_editor(editor)
                 .with_index(pin.id.0 as usize)
                 .with_show_index(false)
                 .with_pin_color(pin_color)
+                .with_canvas(view.canvas)
                 .build(&mut ui.build_ctx());
 
                 view.pin_to_socket.insert(pin.id, socket);
@@ -724,6 +949,12 @@ impl BlueprintEditor {
                 BuiltinNodeKind::Branch => "Branch",
                 BuiltinNodeKind::GetVariable => "GetVariable",
                 BuiltinNodeKind::SetVariable => "SetVariable",
+                BuiltinNodeKind::Self_ => "Self",
+                BuiltinNodeKind::GetActorTransform => "Get Actor Transform",
+                BuiltinNodeKind::SetActorTransform => "Set Actor Transform",
+                BuiltinNodeKind::SpawnActor => "Spawn Actor",
+                BuiltinNodeKind::GetActorByName => "Get Actor By Name",
+                BuiltinNodeKind::GetActorName => "Get Actor Name",
             }
             .to_string();
 
@@ -749,6 +980,15 @@ impl BlueprintEditor {
                     // Variable nodes = green
                     fyrox::core::color::Color::opaque(40, 140, 60)
                 }
+                BuiltinNodeKind::Self_
+                | BuiltinNodeKind::GetActorTransform
+                | BuiltinNodeKind::SetActorTransform
+                | BuiltinNodeKind::SpawnActor
+                | BuiltinNodeKind::GetActorByName
+                | BuiltinNodeKind::GetActorName => {
+                    // World nodes = orange
+                    fyrox::core::color::Color::opaque(200, 120, 40)
+                }
             };
 
             let selected_header_color = fyrox::core::color::Color::opaque(
@@ -760,9 +1000,7 @@ impl BlueprintEditor {
             let mut content = Handle::NONE;
             let mut content_key: Option<&'static str> = None;
 
-            if node.kind == BuiltinNodeKind::Print {
-                content_key = Some("text");
-            } else if matches!(node.kind, BuiltinNodeKind::GetVariable | BuiltinNodeKind::SetVariable) {
+            if matches!(node.kind, BuiltinNodeKind::GetVariable | BuiltinNodeKind::SetVariable) {
                 content_key = Some("name");
             }
 
@@ -830,8 +1068,14 @@ impl BlueprintEditor {
             }
             let data_type = graph
                 .pin(link.from)
-                .map(|p| p.data_type)
-                .or_else(|| graph.pin(link.to).map(|p| p.data_type))
+                .and_then(|p| graph.pin_owner(link.from).and_then(|n| graph.nodes.get(&n)).map(|node| (node, p)))
+                .map(|(node, p)| actual_pin_type(node, p))
+                .or_else(|| {
+                    graph
+                        .pin(link.to)
+                        .and_then(|p| graph.pin_owner(link.to).and_then(|n| graph.nodes.get(&n)).map(|node| (node, p)))
+                        .map(|(node, p)| actual_pin_type(node, p))
+                })
                 .unwrap_or(DataType::Unit);
 
             let is_exec = data_type == DataType::Exec;
@@ -950,7 +1194,8 @@ impl BlueprintEditor {
             return;
         }
 
-        let canvas = AbsmCanvasBuilder::new(WidgetBuilder::new()).build(&mut ui.build_ctx());
+        let canvas =
+            AbsmCanvasBuilder::new(WidgetBuilder::new().with_allow_drop(true)).build(&mut ui.build_ctx());
         let uuid = Uuid::new_v4();
         let definition = {
             let ctx = &mut ui.build_ctx();
@@ -1254,7 +1499,10 @@ impl BlueprintEditor {
             let select = {
                 let label = format!("{} : {}", var.name, data_type_label(var.data_type));
                 let b = ButtonBuilder::new(
-                    WidgetBuilder::new().with_height(24.0).with_width(140.0),
+                    WidgetBuilder::new()
+                        .with_height(24.0)
+                        .with_width(140.0)
+                        .with_allow_drag(true),
                 )
                 .with_text(&label)
                 .build(&mut ui.build_ctx());
@@ -1317,13 +1565,18 @@ impl BlueprintEditor {
     }
 
     fn spawn_get_variable(&mut self, ui: &mut UserInterface, var_index: usize) {
+        let pos = [60.0, 200.0 + (var_index as f32) * 60.0];
+        self.spawn_get_variable_at(ui, var_index, pos);
+    }
+
+    fn spawn_get_variable_at(&mut self, ui: &mut UserInterface, var_index: usize, pos: [f32; 2]) {
         let Some(var) = self.graph.variables.get(var_index) else {
             return;
         };
 
         let mut n = Node::new(BuiltinNodeKind::GetVariable);
         n.graph = self.active_graph_name().to_string();
-        n.position = [60.0, 200.0 + (var_index as f32) * 60.0];
+        n.position = pos;
         n.set_property_string("name", var.name.clone());
         set_pin_data_type_by_name(&mut n, "value", var.data_type);
         let node_id = self.graph.add_node(n);
@@ -1348,6 +1601,16 @@ impl BlueprintEditor {
             _ => n.set_property_string("value", String::new()),
         }
         set_pin_data_type_by_name(&mut n, "value", var.data_type);
+        let node_id = self.graph.add_node(n);
+
+        self.rebuild_all_graph_views(ui);
+        self.set_selected_node(ui, Some(node_id));
+    }
+
+    fn spawn_world_node(&mut self, ui: &mut UserInterface, kind: BuiltinNodeKind) {
+        let mut n = Node::new(kind);
+        n.graph = self.active_graph_name().to_string();
+        n.position = [300.0, 200.0];
         let node_id = self.graph.add_node(n);
 
         self.rebuild_all_graph_views(ui);
@@ -1506,6 +1769,11 @@ impl BlueprintEditor {
                 let ui = engine.user_interfaces.first_mut();
                 self.spawn_set_variable(ui, index);
             }
+
+            if let Some(kind) = self.node_palette_buttons.get(&message.destination()).copied() {
+                let ui = engine.user_interfaces.first_mut();
+                self.spawn_world_node(ui, kind);
+            }
             return;
         }
 
@@ -1572,6 +1840,20 @@ impl BlueprintEditor {
                             {
                                 ui.send(tb, TextMessage::Text(text.clone()));
                             }
+                        }
+
+                        // Also sync any per-pin editor widgets bound to the same property.
+                        let sync_view = |v: &GraphView| {
+                            for (w, (n, k, ty)) in v.node_value_binding.iter() {
+                                if *n == node && k == key && *ty == DataType::String {
+                                    ui.send(*w, TextMessage::Text(text.clone()));
+                                }
+                            }
+                        };
+                        sync_view(&self.event_view);
+                        sync_view(&self.construction_view);
+                        for tab in self.extra_tabs.iter() {
+                            sync_view(&tab.view);
                         }
                     }
                     DetailsBinding::VariableName { index } => {
@@ -1646,6 +1928,22 @@ impl BlueprintEditor {
             BlueprintGraphTab::ConstructionScript => &mut self.construction_view,
         };
 
+        // Drag & drop variables from "My Blueprint" onto the canvas.
+        if message.destination() == view.canvas {
+            if let Some(WidgetMessage::Drop(dragged)) = message.data::<WidgetMessage>() {
+                if let Some(&var_index) = self.my_blueprint_variable_select.get(dragged) {
+                    let local_pos = ui
+                        .node(view.canvas)
+                        .query_component::<AbsmCanvas>()
+                        .map(|c| c.point_to_local_space(ui.cursor_position()))
+                        .unwrap_or(ui.cursor_position());
+
+                    self.spawn_get_variable_at(ui, var_index, [local_pos.x, local_pos.y]);
+                    return;
+                }
+            }
+        }
+
         if let Some(AbsmCanvasMessage::SelectionChanged(selection)) = message.data_from(view.canvas)
         {
             let selected = selection
@@ -1701,20 +1999,24 @@ impl BlueprintEditor {
                 return;
             };
 
+            // Get actual data types (considering dynamic typing for variable nodes)
+            let from_data_type = self.get_actual_pin_type(from).unwrap_or(from_pin.data_type);
+            let to_data_type = self.get_actual_pin_type(to).unwrap_or(to_pin.data_type);
+
             if from_pin.direction != PinDirection::Output
                 || to_pin.direction != PinDirection::Input
-                || from_pin.data_type != to_pin.data_type
+                || from_data_type != to_data_type
             {
                 Log::warn(format!(
                     "BlueprintEditor: CommitConnection rejected: from({:?},{:?}) to({:?},{:?})",
-                    from_pin.direction, from_pin.data_type, to_pin.direction, to_pin.data_type
+                    from_pin.direction, from_data_type, to_pin.direction, to_data_type
                 ));
                 return;
             }
 
             Log::info(format!(
                 "BlueprintEditor: CommitConnection ok: {}({:?}) -> {}({:?})",
-                from_pin.name, from_pin.data_type, to_pin.name, to_pin.data_type
+                from_pin.name, from_data_type, to_pin.name, to_data_type
             ));
 
             // Each input pin can have only one incoming.
@@ -1732,10 +2034,48 @@ impl BlueprintEditor {
             return;
         }
 
+        // Inline node editors.
         if let Some(TextMessage::Text(text)) = message.data::<TextMessage>() {
-            if let Some((node_id, key)) = view.node_text_box_binding.get(&message.destination()) {
+            if let Some((node_id, key, ty)) = view.node_value_binding.get(&message.destination()) {
+                if *ty == DataType::String {
+                    if let Some(node) = self.graph.nodes.get_mut(node_id) {
+                        node.properties.insert(key.clone(), Value::String(text.clone()));
+                    }
+                }
+            } else if let Some((node_id, key)) = view.node_text_box_binding.get(&message.destination()) {
+                // Legacy primary textbox binding (variable node name).
                 if let Some(node) = self.graph.nodes.get_mut(node_id) {
                     node.properties.insert(key.clone(), Value::String(text.clone()));
+                }
+            }
+        }
+
+        if let Some(CheckBoxMessage::Check(Some(value))) = message.data::<CheckBoxMessage>() {
+            if let Some((node_id, key, ty)) = view.node_value_binding.get(&message.destination()) {
+                if *ty == DataType::Bool {
+                    if let Some(node) = self.graph.nodes.get_mut(node_id) {
+                        node.properties.insert(key.clone(), Value::Bool(*value));
+                    }
+                }
+            }
+        }
+
+        if let Some(NumericUpDownMessage::Value(value)) = message.data::<NumericUpDownMessage<i32>>() {
+            if let Some((node_id, key, ty)) = view.node_value_binding.get(&message.destination()) {
+                if *ty == DataType::I32 {
+                    if let Some(node) = self.graph.nodes.get_mut(node_id) {
+                        node.properties.insert(key.clone(), Value::I32(*value));
+                    }
+                }
+            }
+        }
+
+        if let Some(NumericUpDownMessage::Value(value)) = message.data::<NumericUpDownMessage<f32>>() {
+            if let Some((node_id, key, ty)) = view.node_value_binding.get(&message.destination()) {
+                if *ty == DataType::F32 {
+                    if let Some(node) = self.graph.nodes.get_mut(node_id) {
+                        node.properties.insert(key.clone(), Value::F32(*value));
+                    }
                 }
             }
         }
@@ -1751,6 +2091,22 @@ impl BlueprintEditor {
             return false;
         };
         let canvas = tab.view.canvas;
+
+        // Drag & drop variables from "My Blueprint" onto extra graph canvases.
+        if message.destination() == canvas {
+            if let Some(WidgetMessage::Drop(dragged)) = message.data::<WidgetMessage>() {
+                if let Some(&var_index) = self.my_blueprint_variable_select.get(dragged) {
+                    let local_pos = ui
+                        .node(canvas)
+                        .query_component::<AbsmCanvas>()
+                        .map(|c| c.point_to_local_space(ui.cursor_position()))
+                        .unwrap_or(ui.cursor_position());
+
+                    self.spawn_get_variable_at(ui, var_index, [local_pos.x, local_pos.y]);
+                    return true;
+                }
+            }
+        }
 
         if let Some(AbsmCanvasMessage::SelectionChanged(selection)) = message.data_from(canvas) {
             let selected = {
@@ -1819,13 +2175,17 @@ impl BlueprintEditor {
                 return true;
             };
 
+            // Get actual data types (considering dynamic typing for variable nodes)
+            let from_data_type = self.get_actual_pin_type(from).unwrap_or(from_pin.data_type);
+            let to_data_type = self.get_actual_pin_type(to).unwrap_or(to_pin.data_type);
+
             if from_pin.direction != PinDirection::Output
                 || to_pin.direction != PinDirection::Input
-                || from_pin.data_type != to_pin.data_type
+                || from_data_type != to_data_type
             {
                 Log::warn(format!(
                     "BlueprintEditor: CommitConnection rejected: from({:?},{:?}) to({:?},{:?})",
-                    from_pin.direction, from_pin.data_type, to_pin.direction, to_pin.data_type
+                    from_pin.direction, from_data_type, to_pin.direction, to_data_type
                 ));
                 return true;
             }
@@ -1845,17 +2205,69 @@ impl BlueprintEditor {
             return true;
         }
 
+        // Inline node editors (extra tabs).
         if let Some(TextMessage::Text(text)) = message.data::<TextMessage>() {
-            let binding = {
+            let value_binding = {
                 let view = &self.extra_tabs[extra_index].view;
-                view.node_text_box_binding
-                    .get(&message.destination())
-                    .cloned()
+                view.node_value_binding.get(&message.destination()).cloned()
             };
+            if let Some((node_id, key, ty)) = value_binding {
+                if ty == DataType::String {
+                    if let Some(node) = self.graph.nodes.get_mut(&node_id) {
+                        node.properties.insert(key, Value::String(text.clone()));
+                    }
+                }
+            } else {
+                let binding = {
+                    let view = &self.extra_tabs[extra_index].view;
+                    view.node_text_box_binding.get(&message.destination()).cloned()
+                };
+                if let Some((node_id, key)) = binding {
+                    if let Some(node) = self.graph.nodes.get_mut(&node_id) {
+                        node.properties.insert(key, Value::String(text.clone()));
+                    }
+                }
+            }
+        }
 
-            if let Some((node_id, key)) = binding {
-                if let Some(node) = self.graph.nodes.get_mut(&node_id) {
-                    node.properties.insert(key.clone(), Value::String(text.clone()));
+        if let Some(CheckBoxMessage::Check(Some(value))) = message.data::<CheckBoxMessage>() {
+            let value_binding = {
+                let view = &self.extra_tabs[extra_index].view;
+                view.node_value_binding.get(&message.destination()).cloned()
+            };
+            if let Some((node_id, key, ty)) = value_binding {
+                if ty == DataType::Bool {
+                    if let Some(node) = self.graph.nodes.get_mut(&node_id) {
+                        node.properties.insert(key, Value::Bool(*value));
+                    }
+                }
+            }
+        }
+
+        if let Some(NumericUpDownMessage::Value(value)) = message.data::<NumericUpDownMessage<i32>>() {
+            let value_binding = {
+                let view = &self.extra_tabs[extra_index].view;
+                view.node_value_binding.get(&message.destination()).cloned()
+            };
+            if let Some((node_id, key, ty)) = value_binding {
+                if ty == DataType::I32 {
+                    if let Some(node) = self.graph.nodes.get_mut(&node_id) {
+                        node.properties.insert(key, Value::I32(*value));
+                    }
+                }
+            }
+        }
+
+        if let Some(NumericUpDownMessage::Value(value)) = message.data::<NumericUpDownMessage<f32>>() {
+            let value_binding = {
+                let view = &self.extra_tabs[extra_index].view;
+                view.node_value_binding.get(&message.destination()).cloned()
+            };
+            if let Some((node_id, key, ty)) = value_binding {
+                if ty == DataType::F32 {
+                    if let Some(node) = self.graph.nodes.get_mut(&node_id) {
+                        node.properties.insert(key, Value::F32(*value));
+                    }
                 }
             }
         }

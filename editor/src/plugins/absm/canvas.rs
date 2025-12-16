@@ -154,15 +154,26 @@ impl AbsmCanvas {
             entries: self
                 .selection
                 .iter()
-                .map(|n| Entry {
-                    node: *n,
-                    initial_position: ui.node(*n).actual_local_position(),
+                .copied()
+                .filter_map(|node_handle| {
+                    ui.try_get_node(node_handle).map(|n| Entry {
+                        node: node_handle,
+                        initial_position: n.actual_local_position(),
+                    })
                 })
                 .collect(),
         }
     }
 
     fn set_selection(&mut self, new_selection: &[Handle<UiNode>], ui: &UserInterface) {
+        // Selection can contain stale handles if selected nodes were removed externally (for example
+        // when a graph view is rebuilt). Prune invalid handles to avoid panics.
+        let new_selection: Vec<Handle<UiNode>> = new_selection
+            .iter()
+            .copied()
+            .filter(|h| ui.try_get_node(*h).is_some())
+            .collect();
+
         if self.selection != new_selection {
             for &child in self
                 .children()
@@ -175,7 +186,7 @@ impl AbsmCanvas {
                 );
             }
 
-            self.selection = new_selection.to_vec();
+            self.selection = new_selection;
 
             ui.post(
                 self.handle(),
@@ -583,22 +594,20 @@ impl Control for AbsmCanvas {
                 }
                 _ => (),
             }
-        } else if let Some(SocketMessage::StartDragging) = message.data() {
-            if message.direction() == MessageDirection::FromWidget {
-                let socket_ref = ui
-                    .node(message.destination())
-                    .query_component::<Socket>()
-                    .unwrap();
+        } else if let Some(SocketMessage::StartDragging(socket_handle)) = message.data() {
+            let socket_ref = ui
+                .node(*socket_handle)
+                .query_component::<Socket>()
+                .unwrap();
 
-                ui.send(
-                    self.handle(),
-                    AbsmCanvasMessage::SwitchMode(Mode::CreateConnection {
-                        source: message.destination(),
-                        source_pos: self.screen_to_local(socket_ref.screen_position()),
-                        dest_pos: self.screen_to_local(ui.cursor_position()),
-                    }),
-                )
-            }
+            ui.send(
+                self.handle(),
+                AbsmCanvasMessage::SwitchMode(Mode::CreateConnection {
+                    source: *socket_handle,
+                    source_pos: self.screen_to_local(socket_ref.screen_position()),
+                    dest_pos: self.screen_to_local(ui.cursor_position()),
+                }),
+            )
         } else if let Some(WidgetMessage::DesiredPosition(_)) = message.data() {
             if ui
                 .node(message.destination())

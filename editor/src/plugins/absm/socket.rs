@@ -41,10 +41,11 @@ use fyrox::gui::style::resource::StyleResourceExt;
 use fyrox::gui::style::Style;
 use std::ops::{Deref, DerefMut};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SocketMessage {
     // Occurs when user clicks on socket and starts dragging it.
-    StartDragging,
+    // Contains the socket handle that is being dragged
+    StartDragging(Handle<UiNode>),
 }
 impl MessageData for SocketMessage {}
 
@@ -66,12 +67,14 @@ pub struct Socket {
     editor: Handle<UiNode>,
     pin: Handle<UiNode>,
     pub index: usize,
+    pub canvas: Handle<UiNode>,
 }
 
 define_widget_deref!(Socket);
 
 const RADIUS: f32 = 6.0;
 const PIN_SIZE: f32 = RADIUS * 2.0;
+const SOCKET_HEIGHT: f32 = 28.0;
 
 uuid_provider!(Socket = "a6c0473e-7073-4e91-a681-cf88795af52a");
 
@@ -82,7 +85,7 @@ impl Control for Socket {
         if let Some(msg) = message.data::<WidgetMessage>() {
             match msg {
                 WidgetMessage::MouseDown { button, pos } => {
-                    if *button == MouseButton::Left && message.destination() == self.pin {
+                    if !message.handled() && *button == MouseButton::Left {
                         self.click_position = Some(*pos);
 
                         ui.capture_mouse(self.handle());
@@ -102,7 +105,14 @@ impl Control for Socket {
                 WidgetMessage::MouseMove { pos, .. } => {
                     if let Some(click_position) = self.click_position {
                         if click_position.metric_distance(pos) >= 5.0 {
-                            ui.post(self.handle(), SocketMessage::StartDragging);
+                            // Send StartDragging directly to the canvas so it can handle connection creation.
+                            // Include this socket handle so the canvas knows which socket was clicked.
+                            if self.canvas != Handle::NONE {
+                                ui.send(self.canvas, SocketMessage::StartDragging(self.handle()));
+                            } else {
+                                // Fallback: send to self if canvas not set (for compatibility)
+                                ui.send(self.handle(), SocketMessage::StartDragging(self.handle()));
+                            }
                             self.click_position = None;
                         }
                     }
@@ -133,6 +143,7 @@ pub struct SocketBuilder {
     index: usize,
     show_index: bool,
     pin_color: Option<Color>,
+    canvas: Handle<UiNode>,
 }
 
 impl SocketBuilder {
@@ -145,6 +156,7 @@ impl SocketBuilder {
             index: 0,
             show_index: true,
             pin_color: None,
+            canvas: Handle::NONE,
         }
     }
 
@@ -176,6 +188,11 @@ impl SocketBuilder {
 
     pub fn with_pin_color(mut self, color: Color) -> Self {
         self.pin_color = Some(color);
+        self
+    }
+
+    pub fn with_canvas(mut self, canvas: Handle<UiNode>) -> Self {
+        self.canvas = canvas;
         self
     }
 
@@ -253,7 +270,7 @@ impl SocketBuilder {
         let socket = Socket {
             widget: self
                 .widget_builder
-                .with_min_size(Vector2::new(0.0, PIN_SIZE + 4.0))
+                .with_min_size(Vector2::new(0.0, SOCKET_HEIGHT))
                 .with_child(grid)
                 .build(ctx),
             click_position: Default::default(),
@@ -262,6 +279,7 @@ impl SocketBuilder {
             editor: self.editor,
             pin,
             index: self.index,
+            canvas: self.canvas,
         };
 
         ctx.add_node(UiNode::new(socket))

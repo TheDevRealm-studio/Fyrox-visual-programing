@@ -90,6 +90,12 @@ pub enum BuiltinNodeKind {
     Branch,
     GetVariable,
     SetVariable,
+    Self_,
+    GetActorTransform,
+    SetActorTransform,
+    SpawnActor,
+    GetActorByName,
+    GetActorName,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -265,6 +271,120 @@ fn default_pins(kind: BuiltinNodeKind) -> Vec<Pin> {
                 id: PinId(2),
                 name: "value".to_string(),
                 direction: D::Input,
+                data_type: T::String,
+            },
+        ],
+        K::Self_ => vec![
+            Pin {
+                id: PinId(0),
+                name: "self".to_string(),
+                direction: D::Output,
+                data_type: T::String,
+            },
+        ],
+        K::GetActorTransform => vec![
+            Pin {
+                id: PinId(0),
+                name: "exec".to_string(),
+                direction: D::Input,
+                data_type: T::Exec,
+            },
+            Pin {
+                id: PinId(1),
+                name: "then".to_string(),
+                direction: D::Output,
+                data_type: T::Exec,
+            },
+            Pin {
+                id: PinId(2),
+                name: "actor".to_string(),
+                direction: D::Input,
+                data_type: T::String,
+            },
+            Pin {
+                id: PinId(3),
+                name: "position".to_string(),
+                direction: D::Output,
+                data_type: T::String,
+            },
+        ],
+        K::SetActorTransform => vec![
+            Pin {
+                id: PinId(0),
+                name: "exec".to_string(),
+                direction: D::Input,
+                data_type: T::Exec,
+            },
+            Pin {
+                id: PinId(1),
+                name: "then".to_string(),
+                direction: D::Output,
+                data_type: T::Exec,
+            },
+            Pin {
+                id: PinId(2),
+                name: "actor".to_string(),
+                direction: D::Input,
+                data_type: T::String,
+            },
+            Pin {
+                id: PinId(3),
+                name: "position".to_string(),
+                direction: D::Input,
+                data_type: T::String,
+            },
+        ],
+        K::SpawnActor => vec![
+            Pin {
+                id: PinId(0),
+                name: "exec".to_string(),
+                direction: D::Input,
+                data_type: T::Exec,
+            },
+            Pin {
+                id: PinId(1),
+                name: "then".to_string(),
+                direction: D::Output,
+                data_type: T::Exec,
+            },
+            Pin {
+                id: PinId(2),
+                name: "class".to_string(),
+                direction: D::Input,
+                data_type: T::String,
+            },
+            Pin {
+                id: PinId(3),
+                name: "actor".to_string(),
+                direction: D::Output,
+                data_type: T::String,
+            },
+        ],
+        K::GetActorByName => vec![
+            Pin {
+                id: PinId(0),
+                name: "name".to_string(),
+                direction: D::Input,
+                data_type: T::String,
+            },
+            Pin {
+                id: PinId(1),
+                name: "actor".to_string(),
+                direction: D::Output,
+                data_type: T::String,
+            },
+        ],
+        K::GetActorName => vec![
+            Pin {
+                id: PinId(0),
+                name: "actor".to_string(),
+                direction: D::Input,
+                data_type: T::String,
+            },
+            Pin {
+                id: PinId(1),
+                name: "name".to_string(),
+                direction: D::Output,
                 data_type: T::String,
             },
         ],
