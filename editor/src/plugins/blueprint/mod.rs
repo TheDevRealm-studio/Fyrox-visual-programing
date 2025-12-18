@@ -770,16 +770,7 @@ impl BlueprintEditor {
             return;
         }
 
-        // Mirror CommitConnection rules.
-        if from_data_type == DataType::Exec {
-            self.graph.links.retain(|l| l.to != to && l.from != from);
-        } else {
-            self.graph.links.retain(|l| l.to != to);
-        }
-
-        if !self.graph.links.iter().any(|l| l.from == from && l.to == to) {
-            self.graph.links.push(Link::exec(from, to));
-        }
+        self.apply_connection(from, to);
     }
 
     fn close_all_extra_tabs(&mut self, ui: &mut UserInterface) {
@@ -940,6 +931,77 @@ impl BlueprintEditor {
                 }
             }
             _ => Some(pin.data_type),
+        }
+    }
+
+    fn try_resolve_connection(
+        &self,
+        a: PinId,
+        b: PinId,
+        expected_graph: &str,
+    ) -> Option<(PinId, PinId)> {
+        let from_pin_id = a;
+        let to_pin_id = b;
+        if from_pin_id == to_pin_id {
+            return None;
+        }
+
+        let from_pin = self.graph.pin(from_pin_id)?;
+        let to_pin = self.graph.pin(to_pin_id)?;
+
+        let from_owner = self.graph.pin_owner(from_pin_id)?;
+        let to_owner = self.graph.pin_owner(to_pin_id)?;
+
+        if self.graph.nodes.get(&from_owner)?.graph != expected_graph
+            || self.graph.nodes.get(&to_owner)?.graph != expected_graph
+        {
+            return None;
+        }
+
+        // Always resolve direction using the pin metadata (more reliable than UI socket widgets).
+        let (from, to) = match (from_pin.direction, to_pin.direction) {
+            (PinDirection::Output, PinDirection::Input) => (from_pin_id, to_pin_id),
+            (PinDirection::Input, PinDirection::Output) => (to_pin_id, from_pin_id),
+            _ => return None,
+        };
+
+        let (from_pin, to_pin) = (self.graph.pin(from)?, self.graph.pin(to)?);
+
+        let from_data_type = self.get_actual_pin_type(from).unwrap_or(from_pin.data_type);
+        let to_data_type = self.get_actual_pin_type(to).unwrap_or(to_pin.data_type);
+
+        if from_data_type != to_data_type {
+            return None;
+        }
+
+        Some((from, to))
+    }
+
+    fn apply_connection(&mut self, from: PinId, to: PinId) {
+        let (Some(from_pin), Some(to_pin)) = (self.graph.pin(from), self.graph.pin(to)) else {
+            return;
+        };
+
+        let from_data_type = self.get_actual_pin_type(from).unwrap_or(from_pin.data_type);
+        let to_data_type = self.get_actual_pin_type(to).unwrap_or(to_pin.data_type);
+
+        if from_pin.direction != PinDirection::Output
+            || to_pin.direction != PinDirection::Input
+            || from_data_type != to_data_type
+        {
+            return;
+        }
+
+        // Each input pin can have only one incoming.
+        // Additionally, exec output pins can have only one outgoing.
+        if from_data_type == DataType::Exec {
+            self.graph.links.retain(|l| l.to != to && l.from != from);
+        } else {
+            self.graph.links.retain(|l| l.to != to);
+        }
+
+        if !self.graph.links.iter().any(|l| l.from == from && l.to == to) {
+            self.graph.links.push(Link::exec(from, to));
         }
     }
 
@@ -1993,6 +2055,7 @@ impl BlueprintEditor {
         let mut asset = BlueprintAsset {
             version: self.version,
             graph_json,
+            prefab_path: None,
         };
 
         if let Err(err) = asset.save(path) {
@@ -2411,6 +2474,8 @@ impl BlueprintEditor {
             dest_socket,
         }) = message.data_from(view.canvas)
         {
+            let expected_graph = tab_graph_name(tab);
+
             let (Some(a), Some(b)) = (
                 view.socket_to_pin.get(source_socket).copied(),
                 view.socket_to_pin.get(dest_socket).copied(),
@@ -2422,56 +2487,12 @@ impl BlueprintEditor {
                 return;
             };
 
-            let a_dir = ui_node_socket_dir(ui, *source_socket);
-            let b_dir = ui_node_socket_dir(ui, *dest_socket);
-
-            let (from, to) = match (a_dir, b_dir) {
-                (Some(SocketDirection::Output), Some(SocketDirection::Input)) => (a, b),
-                (Some(SocketDirection::Input), Some(SocketDirection::Output)) => (b, a),
-                _ => {
-                    Log::warn(format!(
-                        "BlueprintEditor: CommitConnection rejected: socket directions {:?} -> {:?}",
-                        a_dir, b_dir
-                    ));
-                    return;
-                }
-            };
-
-            let (Some(from_pin), Some(to_pin)) = (self.graph.pin(from), self.graph.pin(to)) else {
-                Log::warn("BlueprintEditor: CommitConnection rejected: missing pins".to_string());
+            let Some((from, to)) = self.try_resolve_connection(a, b, expected_graph) else {
+                Log::warn("BlueprintEditor: CommitConnection rejected".to_string());
                 return;
             };
 
-            // Get actual data types (considering dynamic typing for variable nodes)
-            let from_data_type = self.get_actual_pin_type(from).unwrap_or(from_pin.data_type);
-            let to_data_type = self.get_actual_pin_type(to).unwrap_or(to_pin.data_type);
-
-            if from_pin.direction != PinDirection::Output
-                || to_pin.direction != PinDirection::Input
-                || from_data_type != to_data_type
-            {
-                Log::warn(format!(
-                    "BlueprintEditor: CommitConnection rejected: from({:?},{:?}) to({:?},{:?})",
-                    from_pin.direction, from_data_type, to_pin.direction, to_data_type
-                ));
-                return;
-            }
-
-            Log::info(format!(
-                "BlueprintEditor: CommitConnection ok: {}({:?}) -> {}({:?})",
-                from_pin.name, from_data_type, to_pin.name, to_data_type
-            ));
-
-            // Each input pin can have only one incoming.
-            // Additionally, exec output pins can have only one outgoing.
-            if from_pin.data_type == DataType::Exec {
-                self.graph.links.retain(|l| l.to != to && l.from != from);
-            } else {
-                self.graph.links.retain(|l| l.to != to);
-            }
-            if !self.graph.links.iter().any(|l| l.from == from && l.to == to) {
-                self.graph.links.push(Link::exec(from, to));
-            }
+            self.apply_connection(from, to);
 
             self.rebuild_all_graph_views(ui);
             return;
@@ -2615,11 +2636,12 @@ impl BlueprintEditor {
             dest_socket,
         }) = message.data_from(canvas)
         {
-            let (a, b) = {
+            let (a, b, expected_graph) = {
                 let view = &self.extra_tabs[extra_index].view;
                 (
                     view.socket_to_pin.get(source_socket).copied(),
                     view.socket_to_pin.get(dest_socket).copied(),
+                    self.extra_tabs[extra_index].name.clone(),
                 )
             };
 
@@ -2631,51 +2653,12 @@ impl BlueprintEditor {
                 return true;
             };
 
-            let a_dir = ui_node_socket_dir(ui, *source_socket);
-            let b_dir = ui_node_socket_dir(ui, *dest_socket);
-
-            let (from, to) = match (a_dir, b_dir) {
-                (Some(SocketDirection::Output), Some(SocketDirection::Input)) => (a, b),
-                (Some(SocketDirection::Input), Some(SocketDirection::Output)) => (b, a),
-                _ => {
-                    Log::warn(format!(
-                        "BlueprintEditor: CommitConnection rejected: socket directions {:?} -> {:?}",
-                        a_dir, b_dir
-                    ));
-                    return true;
-                }
-            };
-
-            let (Some(from_pin), Some(to_pin)) = (self.graph.pin(from), self.graph.pin(to)) else {
-                Log::warn("BlueprintEditor: CommitConnection rejected: missing pins".to_string());
+            let Some((from, to)) = self.try_resolve_connection(a, b, &expected_graph) else {
+                Log::warn("BlueprintEditor: CommitConnection rejected".to_string());
                 return true;
             };
 
-            // Get actual data types (considering dynamic typing for variable nodes)
-            let from_data_type = self.get_actual_pin_type(from).unwrap_or(from_pin.data_type);
-            let to_data_type = self.get_actual_pin_type(to).unwrap_or(to_pin.data_type);
-
-            if from_pin.direction != PinDirection::Output
-                || to_pin.direction != PinDirection::Input
-                || from_data_type != to_data_type
-            {
-                Log::warn(format!(
-                    "BlueprintEditor: CommitConnection rejected: from({:?},{:?}) to({:?},{:?})",
-                    from_pin.direction, from_data_type, to_pin.direction, to_data_type
-                ));
-                return true;
-            }
-
-            // Each input pin can have only one incoming.
-            // Additionally, exec output pins can have only one outgoing.
-            if from_pin.data_type == DataType::Exec {
-                self.graph.links.retain(|l| l.to != to && l.from != from);
-            } else {
-                self.graph.links.retain(|l| l.to != to);
-            }
-            if !self.graph.links.iter().any(|l| l.from == from && l.to == to) {
-                self.graph.links.push(Link::exec(from, to));
-            }
+            self.apply_connection(from, to);
 
             self.rebuild_all_graph_views(ui);
             return true;

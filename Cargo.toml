@@ -25,6 +25,7 @@ members = [
     "fyrox-graphics-gl",
     "fyrox-visual-scripting",
     "fyrox-blueprint",
+    "executor",
 ]
 resolver = "2"
 

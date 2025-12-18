@@ -30,20 +30,26 @@ use crate::{
         },
         graph::{BaseSceneGraph, SceneGraph, SceneGraphNode},
         resource::model::{Model, ModelResourceExtension},
-        scene::{node::Node, Scene},
+        scene::{
+            base::BaseBuilder,
+            node::Node,
+            pivot::PivotBuilder,
+            Scene,
+        },
     },
     load_image,
     message::MessageSender,
     scene::{
         commands::{
             graph::SetGraphNodeChildPosition,
-            graph::{AddModelCommand, LinkNodesCommand},
+            graph::{AddModelCommand, AddNodeCommand, LinkNodesCommand},
             ChangeSelectionCommand,
         },
         GameScene, Selection,
     },
     world::{item::DropAnchor, selection::GraphSelection, WorldViewerDataProvider},
 };
+use fyrox_blueprint::{BlueprintAsset, BlueprintScript};
 use fyrox::resource::texture::TextureResource;
 use std::{borrow::Cow, path::Path, path::PathBuf};
 
@@ -219,9 +225,10 @@ impl WorldViewerDataProvider for EditorSceneWrapper<'_> {
 
     fn on_asset_dropped(&mut self, path: PathBuf, node: ErasedHandle) {
         if let Ok(relative_path) = make_relative_path(path) {
+            let relative_path_for_model = relative_path.clone();
             if let Some(model) = self
                 .resource_manager
-                .try_request::<Model>(relative_path)
+                .try_request::<Model>(relative_path_for_model)
                 .and_then(|m| block_on(m).ok())
             {
                 // Instantiate the model.
@@ -240,6 +247,33 @@ impl WorldViewerDataProvider for EditorSceneWrapper<'_> {
                         GraphSelection::single_or_empty(instance),
                     ))),
                 ];
+
+                self.sender.do_command(CommandGroup::from(group));
+            } else if let Some(blueprint) = self
+                .resource_manager
+                .try_request::<BlueprintAsset>(relative_path.clone())
+                .and_then(|b| block_on(b).ok())
+            {
+                let name = relative_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("Blueprint");
+
+                let mut script = BlueprintScript::default();
+                script.blueprint = Some(blueprint).into();
+
+                let blueprint_node = PivotBuilder::new(
+                    BaseBuilder::new()
+                        .with_name(format!("{name} (Blueprint)"))
+                        .with_script(script),
+                )
+                .build_node();
+
+                let group = vec![Command::new(AddNodeCommand::new(
+                    blueprint_node,
+                    node.into(),
+                    true,
+                ))];
 
                 self.sender.do_command(CommandGroup::from(group));
             }

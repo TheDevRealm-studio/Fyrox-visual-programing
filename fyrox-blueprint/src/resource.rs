@@ -19,7 +19,7 @@ use fyrox_visual_scripting::{model::GraphId, BlueprintGraph};
 use std::{
     error::Error,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Once},
 };
 
 #[derive(TypeUuidProvider, Debug, Clone, Visit, Reflect)]
@@ -34,6 +34,12 @@ pub struct BlueprintAsset {
     /// For MVP this is JSON of `fyrox_visual_scripting::BlueprintGraph`.
     #[visit(optional)]
     pub graph_json: String,
+
+    /// Optional prefab path (scene `.rgs`) that represents the actor/components for this blueprint.
+    ///
+    /// Stored as a path relative to the project's working directory (asset root).
+    #[visit(optional)]
+    pub prefab_path: Option<String>,
 }
 
 impl Default for BlueprintAsset {
@@ -48,6 +54,7 @@ impl Default for BlueprintAsset {
         Self {
             version: 1,
             graph_json,
+            prefab_path: None,
         }
     }
 }
@@ -120,12 +127,16 @@ impl ResourceLoader for BlueprintLoader {
 /// Note: if the manager already loaded/scanned its registry, call
 /// `resource_manager.state().update_or_load_registry()` afterwards to re-scan.
 pub fn register_resources(resource_manager: &ResourceManager) {
-    let state = resource_manager.state();
+    static REGISTER_ONCE: Once = Once::new();
 
-    state.constructors_container.add::<BlueprintAsset>();
+    REGISTER_ONCE.call_once(|| {
+        let state = resource_manager.state();
 
-    let mut loaders = state.loaders.safe_lock();
-    loaders.set(BlueprintLoader);
+        state.constructors_container.add::<BlueprintAsset>();
+
+        let mut loaders = state.loaders.safe_lock();
+        loaders.set(BlueprintLoader);
+    });
 }
 
 #[cfg(test)]
@@ -141,11 +152,13 @@ mod tests {
         let path = dir.join(format!("roundtrip.{}", BlueprintLoader::EXT));
 
         let mut asset = BlueprintAsset::default();
+        asset.prefab_path = Some("data/prefabs/test_actor.rgs".to_string());
         asset.save(&path).unwrap();
 
         let io = FsResourceIo;
         let loaded = block_on(BlueprintAsset::from_file(&path, &io)).unwrap();
         assert_eq!(loaded.version, asset.version);
         assert_eq!(loaded.graph_json, asset.graph_json);
+        assert_eq!(loaded.prefab_path, asset.prefab_path);
     }
 }

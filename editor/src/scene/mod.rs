@@ -85,7 +85,9 @@ use crate::{
     scene::{
         clipboard::Clipboard,
         commands::{
-            graph::AddModelCommand, mesh::SetMeshTextureCommand, ChangeSelectionCommand,
+            graph::{AddModelCommand, AddNodeCommand},
+            mesh::SetMeshTextureCommand,
+            ChangeSelectionCommand,
             GameSceneContext,
         },
         controller::SceneController,
@@ -96,6 +98,7 @@ use crate::{
     world::selection::GraphSelection,
     Message, Settings,
 };
+use fyrox_blueprint::{BlueprintAsset, BlueprintScript};
 use fyrox::engine::GraphicsContext;
 use fyrox::gui::file_browser::FileType;
 use fyrox::scene::collider::BitMask;
@@ -707,6 +710,74 @@ impl SceneController for GameScene {
                     ];
 
                     self.sender.do_command(CommandGroup::from(group));
+                } else if let Some(blueprint) = engine
+                    .resource_manager
+                    .try_request::<BlueprintAsset>(relative_path.clone())
+                    .and_then(|b| block_on(b).ok())
+                {
+                    let cursor_pos = engine.user_interfaces.first_mut().cursor_position();
+                    let rel_pos = cursor_pos - screen_bounds.position;
+
+                    let graph = &engine.scenes[self.scene].graph;
+                    let frame_size = screen_bounds.size;
+
+                    let position = if let Some(result) = self.camera_controller.pick(
+                        graph,
+                        PickingOptions {
+                            cursor_pos: rel_pos,
+                            editor_only: false,
+                            filter: None,
+                            ignore_back_faces: settings.selection.ignore_back_faces,
+                            use_picking_loop: false,
+                            method: Default::default(),
+                            settings: &settings.selection,
+                        },
+                    ) {
+                        Some(result.position)
+                    } else {
+                        let camera = graph[self.camera_controller.camera]
+                            .component_ref::<Camera>()
+                            .unwrap();
+
+                        let normal = match camera.projection() {
+                            Projection::Perspective(_) => Vector3::new(0.0, 1.0, 0.0),
+                            Projection::Orthographic(_) => Vector3::new(0.0, 0.0, 1.0),
+                        };
+
+                        let plane =
+                            Plane::from_normal_and_point(&normal, &Default::default())
+                                .unwrap_or_default();
+                        let ray = camera.make_ray(rel_pos, frame_size);
+                        ray.plane_intersection_point(&plane)
+                    };
+
+                    let name = relative_path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("Blueprint");
+
+                    let mut script = BlueprintScript::default();
+                    script.blueprint = Some(blueprint).into();
+
+                    let mut blueprint_node = PivotBuilder::new(
+                        BaseBuilder::new()
+                            .with_name(format!("{name} (Blueprint)"))
+                            .with_script(script),
+                    )
+                    .build_node();
+
+                    if let Some(position) = position {
+                        blueprint_node
+                            .local_transform_mut()
+                            .set_position(settings.move_mode_settings.try_snap_vector_to_grid(
+                                position,
+                            ));
+                    }
+
+                    self.sender
+                        .do_command(CommandGroup::from(vec![Command::new(
+                            AddNodeCommand::new(blueprint_node, Handle::NONE, true),
+                        )]));
                 } else if let Some(tex) = engine
                     .resource_manager
                     .try_request::<Texture>(relative_path)

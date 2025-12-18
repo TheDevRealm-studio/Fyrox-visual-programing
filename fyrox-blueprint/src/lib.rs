@@ -1,4 +1,5 @@
 mod resource;
+mod screen_log;
 
 use fyrox::{
     core::{
@@ -18,7 +19,10 @@ use fyrox_visual_scripting::{
     BlueprintGraph,
 };
 
+use std::sync::Once;
+
 pub use crate::resource::{register_resources, BlueprintAsset, BlueprintLoader, BlueprintResource};
+pub use crate::screen_log::BlueprintScreenLogPlugin;
 
 #[derive(Visit, Reflect)]
 #[reflect(non_cloneable)]
@@ -30,6 +34,10 @@ pub struct BlueprintScript {
     #[reflect(hidden)]
     #[visit(optional)]
     pub construction_ran: InheritableVariable<bool>,
+
+    #[reflect(hidden)]
+    #[visit(optional)]
+    pub begin_play_ran: InheritableVariable<bool>,
 
     #[reflect(hidden)]
     #[visit(skip)]
@@ -45,6 +53,7 @@ impl std::fmt::Debug for BlueprintScript {
         f.debug_struct("BlueprintScript")
             .field("blueprint", &"<resource>")
             .field("construction_ran", &*self.construction_ran)
+            .field("begin_play_ran", &*self.begin_play_ran)
             .finish()
     }
 }
@@ -54,6 +63,7 @@ impl Clone for BlueprintScript {
         Self {
             blueprint: self.blueprint.clone(),
             construction_ran: self.construction_ran.clone(),
+            begin_play_ran: self.begin_play_ran.clone(),
             compiled: None,
             interpreter: None,
         }
@@ -65,6 +75,7 @@ impl Default for BlueprintScript {
         Self {
             blueprint: Default::default(),
             construction_ran: false.into(),
+            begin_play_ran: false.into(),
             compiled: None,
             interpreter: None,
         }
@@ -115,75 +126,103 @@ impl BlueprintScript {
         self.compiled = Some(compiled);
     }
 
-    fn flush_events(&self, events: Vec<ExecutionEvent>) {
+    fn flush_events(&self, mut ctx: Option<&mut ScriptContext>, events: Vec<ExecutionEvent>) {
         for event in events {
             match event {
                 ExecutionEvent::EnterNode(_) => {}
                 ExecutionEvent::Print(text) => {
                     Log::info(format!("[Blueprint] {text}"));
+
+                    if let Some(ctx) = ctx.as_deref_mut() {
+                        if let Some(screen_log) =
+                            ctx.plugins.of_type_mut::<BlueprintScreenLogPlugin>()
+                        {
+                            screen_log.push(text);
+                        }
+                    }
                 }
             }
         }
     }
 
-    fn run_construction(&mut self) {
+    fn run_construction(&mut self, ctx: Option<&mut ScriptContext>) {
         self.ensure_compiled();
         let Some(interpreter) = self.interpreter.as_mut() else {
             return;
         };
 
         let out = interpreter.run_construction_script();
-        self.flush_events(out.events);
+        self.flush_events(ctx, out.events);
         *self.construction_ran = true;
     }
 
-    fn run_begin_play(&mut self) {
+    fn run_begin_play(&mut self, ctx: Option<&mut ScriptContext>) {
         self.ensure_compiled();
         let Some(interpreter) = self.interpreter.as_mut() else {
             return;
         };
 
         let out = interpreter.run_begin_play();
-        self.flush_events(out.events);
+        self.flush_events(ctx, out.events);
+        *self.begin_play_ran = true;
     }
 
-    fn run_tick(&mut self, dt: f32) {
+    fn run_tick(&mut self, ctx: &mut ScriptContext) {
         self.ensure_compiled();
         let Some(interpreter) = self.interpreter.as_mut() else {
             return;
         };
 
-        let out = interpreter.tick(dt);
-        self.flush_events(out.events);
+        let out = interpreter.tick(ctx.dt);
+        self.flush_events(Some(ctx), out.events);
     }
 }
 
 impl ScriptTrait for BlueprintScript {
-    fn on_init(&mut self, _ctx: &mut ScriptContext) {
+    fn on_init(&mut self, ctx: &mut ScriptContext) {
         // Construction Script (fresh instances). For loaded instances (save games), `on_init` might
         // be skipped by the engine; `on_start` below will handle that.
         if !*self.construction_ran {
-            self.run_construction();
+            self.run_construction(Some(ctx));
         }
     }
 
-    fn on_start(&mut self, _ctx: &mut ScriptContext) {
+    fn on_start(&mut self, ctx: &mut ScriptContext) {
         // Ensure Construction Script runs before BeginPlay.
         if !*self.construction_ran {
-            self.run_construction();
+            self.run_construction(Some(ctx));
         }
 
-        self.run_begin_play();
+        // BeginPlay might not run here if the blueprint resource is still loading.
+        if !*self.begin_play_ran {
+            self.run_begin_play(Some(ctx));
+        }
     }
 
     fn on_update(&mut self, ctx: &mut ScriptContext) {
-        self.run_tick(ctx.dt);
+        // If the blueprint resource was still loading during on_start, try again on update.
+        if !*self.construction_ran {
+            self.run_construction(Some(ctx));
+        }
+
+        if !*self.begin_play_ran {
+            self.run_begin_play(Some(ctx));
+        }
+
+        // Match typical gameplay order: no ticking before BeginPlay.
+        if *self.begin_play_ran {
+            self.run_tick(ctx);
+        }
     }
 }
 
 /// Registers blueprint-related scripts in the given constructor container.
 pub fn register(container: &ScriptConstructorContainer) {
-    container.add::<BlueprintScript>("Blueprint Script");
+    static REGISTER_ONCE: Once = Once::new();
+
+    REGISTER_ONCE.call_once(|| {
+        container.add::<BlueprintScript>("Blueprint Script");
+    });
 }
 
 #[cfg(test)]
@@ -214,6 +253,7 @@ mod tests {
         let asset = BlueprintAsset {
             version: 1,
             graph_json: json,
+            prefab_path: None,
         };
         let parsed: BlueprintGraph = serde_json::from_str(&asset.graph_json).unwrap();
         assert!(compile(&parsed).is_ok());

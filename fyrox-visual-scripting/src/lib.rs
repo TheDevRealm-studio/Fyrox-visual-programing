@@ -100,7 +100,7 @@ mod tests {
         });
 
         let begin_play = graph.add_node(Node::new(BuiltinNodeKind::BeginPlay));
-        
+
         // Create GetVariable node
         let mut get_var = Node::new(BuiltinNodeKind::GetVariable);
         get_var.set_property_string("name", "message".to_string());

@@ -221,9 +221,11 @@ where
         entity.downcast_mut::<Handle<N>>(&mut |handle| {
             if let Some(handle) = handle {
                 if handle.is_some() && !self.try_map(handle) {
+                    let bad_handle = *handle;
+                    *handle = Handle::NONE;
                     Log::warn(format!(
                         "Failed to remap handle {} of node {}!",
-                        *handle, node_name
+                        bad_handle, node_name
                     ));
                 }
                 mapped = true;
@@ -241,10 +243,15 @@ where
                     && handle.reflect_is_some()
                     && !self.try_map_reflect(handle)
                 {
+                    let bad_index = handle.reflect_index();
+                    let bad_generation = handle.reflect_generation();
+                    // Reset to NONE to avoid dangling handles after copy/instantiation.
+                    handle.reflect_set_index(0);
+                    handle.reflect_set_generation(0);
                     Log::warn(format!(
                         "Failed to remap handle {}:{} of node {}!",
-                        handle.reflect_index(),
-                        handle.reflect_generation(),
+                        bad_index,
+                        bad_generation,
                         node_name
                     ));
                 }
@@ -363,9 +370,11 @@ where
         entity.downcast_mut::<Handle<N>>(&mut |result| {
             if let Some(handle) = result {
                 if do_map && handle.is_some() && !self.try_map(handle) {
+                    let bad_handle = *handle;
+                    *handle = Handle::NONE;
                     Log::warn(format!(
                         "Failed to remap handle {} of node {}!",
-                        *handle, node_name
+                        bad_handle, node_name
                     ));
                 }
                 mapped = true;
@@ -384,10 +393,14 @@ where
                     && handle.reflect_is_some()
                     && !self.try_map_reflect(handle)
                 {
+                    let bad_index = handle.reflect_index();
+                    let bad_generation = handle.reflect_generation();
+                    handle.reflect_set_index(0);
+                    handle.reflect_set_generation(0);
                     Log::warn(format!(
                         "Failed to remap handle {}:{} of node {}!",
-                        handle.reflect_index(),
-                        handle.reflect_generation(),
+                        bad_index,
+                        bad_generation,
                         node_name
                     ));
                 }
