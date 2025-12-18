@@ -1,13 +1,16 @@
 use crate::{
     fyrox::{
-        asset::manager::ResourceManager,
+        asset::io::FsResourceIo,
         asset::ResourceData,
         core::{
             futures::executor::block_on,
+            color::Color,
             log::Log,
             make_relative_path,
+            algebra::{UnitQuaternion, Vector2, Vector3},
             pool::{ErasedHandle, Handle, Pool},
             reflect::prelude::*,
+            visitor::Visitor,
             uuid::Uuid,
         },
         engine::Engine,
@@ -19,6 +22,8 @@ use crate::{
             dock::{DockingManagerBuilder, DockingManagerMessage, TileBuilder, TileContent},
             dropdown_list::{DropdownListBuilder, DropdownListMessage},
             grid::{Column, GridBuilder, Row},
+            image::ImageBuilder,
+            inspector::{InspectorBuilder, InspectorContext, InspectorContextArgs, InspectorMessage, PropertyAction},
             list_view::{ListViewBuilder, ListViewMessage},
             message::{MessageDirection, MouseButton, UiMessage},
             numeric::{NumericUpDownBuilder, NumericUpDownMessage},
@@ -29,13 +34,25 @@ use crate::{
             text::TextBuilder,
             text::TextMessage,
             text_box::{TextBoxBuilder},
+            tree::{TreeBuilder, TreeRootBuilder, TreeRootMessage},
             utils::make_dropdown_list_option,
             widget::{WidgetBuilder, WidgetMessage},
             window::{WindowBuilder, WindowMessage, WindowTitle},
             BuildContext, HorizontalAlignment, Orientation, Thickness, UiNode, UserInterface,
         },
+        resource::texture::{TextureResource, TextureResourceExtension},
+        scene::{
+            base::BaseBuilder,
+            camera::CameraBuilder,
+            light::{directional::DirectionalLightBuilder, BaseLightBuilder},
+            node::Node as SceneNode,
+            pivot::{Pivot, PivotBuilder},
+            transform::TransformBuilder,
+            Scene, SceneLoader,
+        },
     },
     plugin::EditorPlugin,
+    message::MessageSender,
     Editor, Message,
 };
 use fyrox::gui::window::WindowAlignment;
@@ -49,6 +66,7 @@ use fyrox_visual_scripting::model::VariableDef;
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
+    sync::Arc,
 };
 
 use crate::plugins::absm::{
@@ -57,6 +75,26 @@ use crate::plugins::absm::{
     node::{AbsmNodeBuilder, AbsmNodeLayout},
     socket::{Socket, SocketBuilder, SocketDirection},
 };
+
+use crate::plugins::inspector::editors::make_property_editors_container;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewportDragMode {
+    Orbit,
+    Pan,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum AddComponentKind {
+    SceneComponent,
+    StaticMesh,
+    Camera,
+    DirectionalLight,
+    PointLight,
+    SpotLight,
+    RigidBody,
+    Collider,
+}
 
 #[derive(Clone, Debug, Reflect)]
 struct BlueprintNodeModel {
@@ -161,6 +199,37 @@ struct BlueprintEditor {
     save: fyrox::core::pool::Handle<UiNode>,
     tab_control: fyrox::core::pool::Handle<UiNode>,
 
+    // Viewport/Components (Actor Blueprint authoring).
+    viewport_image: Handle<UiNode>,
+    preview_render_target: TextureResource,
+    preview_scene: Handle<Scene>,
+    preview_actor_root: Handle<SceneNode>,
+    prefab_path: Option<String>,
+
+    // Preview viewport camera controls.
+    preview_camera_pivot: Handle<SceneNode>,
+    preview_camera: Handle<SceneNode>,
+    viewport_drag: Option<ViewportDragMode>,
+    viewport_last_pos: Option<Vector2<f32>>,
+    viewport_yaw: f32,
+    viewport_pitch: f32,
+    viewport_distance: f32,
+    viewport_target: Vector3<f32>,
+
+    components_tree_root: Handle<UiNode>,
+    add_component: Handle<UiNode>,
+    add_component_menu: Handle<UiNode>,
+    add_component_button_actions: HashMap<Handle<UiNode>, AddComponentKind>,
+    components_root_items: Vec<Handle<UiNode>>,
+    components_actor_item: Option<Handle<UiNode>>,
+    components_item_to_node: HashMap<Handle<UiNode>, Handle<SceneNode>>,
+    selected_component: Option<Handle<SceneNode>>,
+
+    details_graph_root: Handle<UiNode>,
+    details_component_root: Handle<UiNode>,
+    component_inspector: Handle<UiNode>,
+    property_editors: Arc<fyrox::gui::inspector::editors::PropertyEditorDefinitionContainer>,
+
     my_blueprint_graphs_event: fyrox::core::pool::Handle<UiNode>,
     my_blueprint_graphs_construction: fyrox::core::pool::Handle<UiNode>,
     my_blueprint_new_graph: fyrox::core::pool::Handle<UiNode>,
@@ -224,7 +293,45 @@ impl BlueprintEditor {
         tab_graph_name(self.active_tab)
     }
 
-    fn new(engine: &mut Engine) -> Self {
+    fn new(engine: &mut Engine, sender: MessageSender) -> Self {
+        let property_editors = Arc::new(make_property_editors_container(
+            sender,
+            engine.resource_manager.clone(),
+        ));
+
+        // Create a dedicated preview scene rendered to a texture for the Viewport tab.
+        let preview_render_target = TextureResource::new_render_target(960, 540);
+
+        let mut preview_scene = Scene::new();
+        preview_scene.set_skybox(None);
+        preview_scene.rendering_options.render_target = Some(preview_render_target.clone());
+        preview_scene.rendering_options.clear_color = Some(Color::opaque(30, 30, 30));
+
+        // Actor root (saved as prefab). Preview-only nodes (camera/light) must NOT be children of this node.
+        let preview_actor_root = PivotBuilder::new(BaseBuilder::new().with_name("Actor"))
+            .build(&mut preview_scene.graph);
+
+        // Minimal lighting + camera.
+        DirectionalLightBuilder::new(BaseLightBuilder::new(BaseBuilder::new()))
+            .build(&mut preview_scene.graph);
+
+        let preview_camera_pivot = PivotBuilder::new(BaseBuilder::new().with_name("CameraPivot"))
+            .build(&mut preview_scene.graph);
+
+        let preview_camera = CameraBuilder::new(
+            BaseBuilder::new().with_local_transform(
+                TransformBuilder::new()
+                    .with_local_position(Vector3::new(0.0, 0.0, -3.0))
+                    .build(),
+            ),
+        )
+        .build(&mut preview_scene.graph);
+
+        preview_scene.graph.link_nodes(preview_camera, preview_camera_pivot);
+
+        preview_scene.graph.update_hierarchical_data();
+        let preview_scene = engine.scenes.add(preview_scene);
+
         let ctx = &mut engine.user_interfaces.first_mut().build_ctx();
 
         let mut node_palette_buttons = HashMap::new();
@@ -239,6 +346,15 @@ impl BlueprintEditor {
         let my_blueprint_new_function;
         let my_blueprint_functions_panel;
         let details_panel;
+        let details_graph_root;
+        let details_component_root;
+        let component_inspector;
+        let components_tree_root;
+        let add_component;
+        let add_component_menu;
+
+        let mut add_component_button_actions: HashMap<Handle<UiNode>, AddComponentKind> =
+            HashMap::new();
 
         let action_menu;
         let action_menu_search;
@@ -248,6 +364,7 @@ impl BlueprintEditor {
         let construction_canvas;
 
         let tab_control;
+        let viewport_image;
 
         let toolbar = StackPanelBuilder::new(
             WidgetBuilder::new()
@@ -269,11 +386,80 @@ impl BlueprintEditor {
             .can_minimize(false)
             .with_title(WindowTitle::text("Components"))
             .with_content(
-                TextBuilder::new(WidgetBuilder::new().with_margin(Thickness::uniform(4.0)))
-                    .with_text("(MVP) Components panel")
-                    .build(ctx),
+                GridBuilder::new(
+                    WidgetBuilder::new()
+                        .with_margin(Thickness::uniform(4.0))
+                        .with_child({
+                            add_component = ButtonBuilder::new(WidgetBuilder::new().with_height(24.0))
+                                .with_text("+ Add Component")
+                                .build(ctx);
+                            add_component
+                        })
+                        .with_child(
+                            ScrollViewerBuilder::new(WidgetBuilder::new().on_row(1))
+                                .with_content({
+                                    components_tree_root =
+                                        TreeRootBuilder::new(WidgetBuilder::new()).build(ctx);
+                                    components_tree_root
+                                })
+                                .build(ctx),
+                        ),
+                )
+                .add_row(Row::auto())
+                .add_row(Row::stretch())
+                .add_column(Column::stretch())
+                .build(ctx),
             )
             .build(ctx);
+
+        // Add Component popup menu.
+        add_component_menu = {
+            let entries: &[(AddComponentKind, &str)] = &[
+                (AddComponentKind::SceneComponent, "Scene Component"),
+                (AddComponentKind::StaticMesh, "Static Mesh"),
+                (AddComponentKind::Camera, "Camera"),
+                (AddComponentKind::DirectionalLight, "Directional Light"),
+                (AddComponentKind::PointLight, "Point Light"),
+                (AddComponentKind::SpotLight, "Spot Light"),
+                (AddComponentKind::RigidBody, "Rigid Body"),
+                (AddComponentKind::Collider, "Collider"),
+            ];
+
+            let mut items: Vec<Handle<UiNode>> = Vec::new();
+            for (kind, label) in entries.iter().copied() {
+                let b = ButtonBuilder::new(
+                    WidgetBuilder::new()
+                        .with_height(22.0)
+                        .with_margin(Thickness::uniform(2.0)),
+                )
+                .with_text(label)
+                .build(ctx);
+                add_component_button_actions.insert(b, kind);
+                items.push(b);
+            }
+
+            let list = StackPanelBuilder::new(WidgetBuilder::new().with_children(items))
+                .with_orientation(Orientation::Vertical)
+                .build(ctx);
+
+            let scroll = ScrollViewerBuilder::new(
+                WidgetBuilder::new().with_min_size(Vector2::new(220.0, 0.0)),
+            )
+            .with_content(list)
+            .build(ctx);
+
+            let content = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_foreground(ctx.style.property(Style::BRUSH_LIGHT))
+                    .with_child(scroll),
+            )
+            .with_pad_by_corner_radius(false)
+            .build(ctx);
+
+            PopupBuilder::new(WidgetBuilder::new().with_visibility(false))
+                .with_content(content)
+                .build(ctx)
+        };
 
         let my_blueprint_window = WindowBuilder::new(WidgetBuilder::new().with_width(260.0).with_height(340.0))
             .can_close(false)
@@ -420,7 +606,14 @@ impl BlueprintEditor {
         construction_canvas =
             AbsmCanvasBuilder::new(WidgetBuilder::new().with_allow_drop(true)).build(ctx);
 
+        // Viewport tab.
+        viewport_image = ImageBuilder::new(WidgetBuilder::new().with_allow_drop(false))
+            .with_flip(true)
+            .with_texture(preview_render_target.clone())
+            .build(ctx);
+
         tab_control = TabControlBuilder::new(WidgetBuilder::new())
+            .with_tab(make_tab("Viewport", viewport_image, ctx))
             .with_tab(make_tab("Event Graph", event_canvas, ctx))
             .with_tab(make_tab("Construction Script", construction_canvas, ctx))
             .build(ctx);
@@ -432,7 +625,28 @@ impl BlueprintEditor {
             .with_content(tab_control)
             .build(ctx);
 
-        details_panel = StackPanelBuilder::new(WidgetBuilder::new().with_margin(Thickness::uniform(4.0)))
+        details_panel = StackPanelBuilder::new(
+            WidgetBuilder::new().with_margin(Thickness::uniform(4.0)),
+        )
+        .build(ctx);
+
+        // Component inspector (used in Viewport tab).
+        let dummy_node = SceneNode::from(Pivot::default());
+        let component_inspector_context = InspectorContext::from_object(InspectorContextArgs {
+            object: &dummy_node,
+            ctx,
+            definition_container: property_editors.clone(),
+            environment: None,
+            layer_index: 0,
+            generate_property_string_values: true,
+            filter: Default::default(),
+            name_column_width: 150.0,
+            base_path: Default::default(),
+            has_parent_object: false,
+        });
+
+        component_inspector = InspectorBuilder::new(WidgetBuilder::new())
+            .with_context(component_inspector_context)
             .build(ctx);
 
         let details_window = WindowBuilder::new(WidgetBuilder::new().with_width(320.0))
@@ -440,9 +654,26 @@ impl BlueprintEditor {
             .can_minimize(false)
             .with_title(WindowTitle::text("Details"))
             .with_content(
-                ScrollViewerBuilder::new(WidgetBuilder::new())
-                    .with_content(details_panel)
-                    .build(ctx),
+                GridBuilder::new(
+                    WidgetBuilder::new()
+                        .with_child({
+                            details_graph_root = ScrollViewerBuilder::new(WidgetBuilder::new())
+                                .with_content(details_panel)
+                                .build(ctx);
+                            details_graph_root
+                        })
+                        .with_child({
+                            details_component_root = ScrollViewerBuilder::new(
+                                WidgetBuilder::new().with_visibility(false),
+                            )
+                            .with_content(component_inspector)
+                            .build(ctx);
+                            details_component_root
+                        }),
+                )
+                .add_row(Row::stretch())
+                .add_column(Column::stretch())
+                .build(ctx),
             )
             .build(ctx);
 
@@ -553,6 +784,35 @@ impl BlueprintEditor {
             save,
             tab_control,
 
+            viewport_image,
+            preview_render_target,
+            preview_scene,
+            preview_actor_root,
+            prefab_path: None,
+
+            preview_camera_pivot,
+            preview_camera,
+            viewport_drag: None,
+            viewport_last_pos: None,
+            viewport_yaw: 0.0,
+            viewport_pitch: 0.0,
+            viewport_distance: 3.0,
+            viewport_target: Vector3::new(0.0, 0.0, 0.0),
+
+            components_tree_root,
+            add_component,
+            add_component_menu,
+            add_component_button_actions,
+            components_root_items: Vec::new(),
+            components_actor_item: None,
+            components_item_to_node: HashMap::new(),
+            selected_component: None,
+
+            details_graph_root,
+            details_component_root,
+            component_inspector,
+            property_editors,
+
             my_blueprint_graphs_event,
             my_blueprint_graphs_construction,
             my_blueprint_new_graph,
@@ -600,6 +860,245 @@ impl BlueprintEditor {
 
             extra_tabs: Vec::new(),
         }
+    }
+
+    fn prefab_absolute_path(&self) -> Option<PathBuf> {
+        let prefab = PathBuf::from(self.prefab_path.as_deref()?);
+
+        if prefab.is_absolute() {
+            return Some(prefab);
+        }
+
+        // Try relative to the blueprint file first.
+        if let Some(bp_path) = self.path.as_ref() {
+            if let Some(parent) = bp_path.parent() {
+                let candidate = parent.join(&prefab);
+                if candidate.exists() {
+                    return Some(candidate);
+                }
+            }
+        }
+
+        Some(prefab)
+    }
+
+    fn clear_preview_actor(&self, engine: &mut Engine) {
+        let scene = &mut engine.scenes[self.preview_scene];
+
+        if !scene.graph.is_valid_handle(self.preview_actor_root) {
+            return;
+        }
+
+        let children = scene.graph[self.preview_actor_root].children().to_vec();
+        for child in children {
+            scene.graph.remove_node(child);
+        }
+        scene.graph.update_hierarchical_data();
+    }
+
+    fn select_component_in_tree(&self, engine: &mut Engine, node: Handle<SceneNode>) {
+        let ui = engine.user_interfaces.first_mut();
+        if let Some((&item, _)) = self
+            .components_item_to_node
+            .iter()
+            .find(|(_, &scene_node)| scene_node == node)
+        {
+            ui.send(self.components_tree_root, TreeRootMessage::Select(vec![item]));
+        }
+    }
+
+    fn apply_viewport_camera(&self, engine: &mut Engine) {
+        let scene = &mut engine.scenes[self.preview_scene];
+        if !scene.graph.is_valid_handle(self.preview_camera_pivot)
+            || !scene.graph.is_valid_handle(self.preview_camera)
+        {
+            return;
+        }
+
+        scene.graph[self.preview_camera]
+            .local_transform_mut()
+            .set_position(Vector3::new(0.0, 0.0, -self.viewport_distance));
+
+        let rot = UnitQuaternion::from_euler_angles(self.viewport_pitch, self.viewport_yaw, 0.0);
+        let pivot = &mut scene.graph[self.preview_camera_pivot];
+        pivot
+            .local_transform_mut()
+            .set_position(self.viewport_target)
+            .set_rotation(rot);
+
+        scene.graph.update_hierarchical_data();
+    }
+
+    fn load_preview_prefab(&mut self, engine: &mut Engine) {
+        self.clear_preview_actor(engine);
+
+        let Some(prefab_abs) = self.prefab_absolute_path() else {
+            return;
+        };
+
+        let resource_manager = engine.resource_manager.clone();
+        let serialization_context = engine.serialization_context.clone();
+        let loader = match block_on(SceneLoader::from_file(
+            &prefab_abs,
+            &FsResourceIo,
+            serialization_context,
+            resource_manager,
+        )) {
+            Ok(loader) => loader,
+            Err(err) => {
+                Log::err(format!(
+                    "BlueprintEditor: failed to load prefab {}: {err}",
+                    prefab_abs.display()
+                ));
+                return;
+            }
+        };
+
+        let loaded_scene = block_on(loader.0.finish());
+
+        let preview_scene = &mut engine.scenes[self.preview_scene];
+        let loaded_root = loaded_scene.graph.get_root();
+        let loaded_root_children = loaded_scene.graph[loaded_root].children().to_vec();
+
+        for child in loaded_root_children {
+            let (copy_root, _) = loaded_scene.graph.copy_node(
+                child,
+                &mut preview_scene.graph,
+                &mut |_, _| true,
+                &mut |_, _| {},
+                &mut |_, _, _| {},
+            );
+            preview_scene.graph.link_nodes(copy_root, self.preview_actor_root);
+        }
+
+        preview_scene.graph.update_hierarchical_data();
+    }
+
+    fn save_preview_prefab(&self, prefab_path: &PathBuf, engine: &Engine) -> Result<(), String> {
+        let source_scene = &engine.scenes[self.preview_scene];
+        if !source_scene.graph.is_valid_handle(self.preview_actor_root) {
+            return Ok(());
+        }
+
+        let mut dest_scene = Scene::new();
+        dest_scene.set_skybox(None);
+
+        let dest_actor_root = PivotBuilder::new(BaseBuilder::new().with_name("Actor"))
+            .build(&mut dest_scene.graph);
+
+        let children = source_scene.graph[self.preview_actor_root].children().to_vec();
+        for child in children {
+            let (copied_root, _) = source_scene.graph.copy_node(
+                child,
+                &mut dest_scene.graph,
+                &mut |_, _| true,
+                &mut |_, _| {},
+                &mut |_, _, _| {},
+            );
+            dest_scene.graph.link_nodes(copied_root, dest_actor_root);
+        }
+
+        dest_scene.graph.update_hierarchical_data();
+
+        let mut visitor = Visitor::new();
+        dest_scene
+            .save("Scene", &mut visitor)
+            .map_err(|e| format!("Failed to serialize prefab scene: {e:?}"))?;
+        visitor
+            .save_ascii_to_file(prefab_path)
+            .map_err(|e| format!("Failed to write prefab file: {e:?}"))?;
+
+        Ok(())
+    }
+
+    fn build_component_tree_item(
+        &mut self,
+        ctx: &mut BuildContext,
+        scene: &Scene,
+        node_handle: Handle<SceneNode>,
+    ) -> Handle<UiNode> {
+        let node = &scene.graph[node_handle];
+
+        let name = if node.name().is_empty() {
+            format!("{node_handle:?}")
+        } else {
+            node.name().to_string()
+        };
+
+        let items = node
+            .children()
+            .iter()
+            .copied()
+            .map(|c| self.build_component_tree_item(ctx, scene, c))
+            .collect();
+
+        let tree = TreeBuilder::new(WidgetBuilder::new())
+            .with_items(items)
+            .with_content(TextBuilder::new(WidgetBuilder::new()).with_text(name).build(ctx))
+            .build(ctx);
+
+        self.components_item_to_node.insert(tree, node_handle);
+
+        tree
+    }
+
+    fn rebuild_components_tree(&mut self, engine: &mut Engine) {
+        let (user_interfaces, scenes) = (&mut engine.user_interfaces, &engine.scenes);
+        let ui = user_interfaces.first_mut();
+
+        for item in self.components_root_items.drain(..) {
+            ui.send(item, WidgetMessage::Remove);
+        }
+
+        self.components_item_to_node.clear();
+        self.components_actor_item = None;
+        self.selected_component = None;
+
+        let scene_handle = self.preview_scene;
+        let actor_root = self.preview_actor_root;
+        if !scenes[scene_handle].graph.is_valid_handle(actor_root) {
+            ui.send(self.components_tree_root, TreeRootMessage::Items(vec![]));
+            return;
+        }
+
+        let scene = &scenes[scene_handle];
+        let root_item = {
+            let ctx = &mut ui.build_ctx();
+            self.build_component_tree_item(ctx, scene, actor_root)
+        };
+
+        self.components_actor_item = Some(root_item);
+        self.components_root_items = vec![root_item];
+        ui.send(self.components_tree_root, TreeRootMessage::Items(vec![root_item]));
+        ui.send(self.components_tree_root, TreeRootMessage::Select(vec![root_item]));
+    }
+
+    fn set_component_selection(&mut self, engine: &mut Engine, node: Handle<SceneNode>) {
+        self.selected_component = Some(node);
+
+        let (user_interfaces, scenes) = (&mut engine.user_interfaces, &engine.scenes);
+        let ui = user_interfaces.first_mut();
+
+        let scene = &scenes[self.preview_scene];
+        if !scene.graph.is_valid_handle(node) {
+            ui.send(self.component_inspector, InspectorMessage::Context(Default::default()));
+            return;
+        }
+
+        let context = InspectorContext::from_object(InspectorContextArgs {
+            object: &scene.graph[node],
+            ctx: &mut ui.build_ctx(),
+            definition_container: self.property_editors.clone(),
+            environment: None,
+            layer_index: 0,
+            generate_property_string_values: true,
+            filter: Default::default(),
+            name_column_width: 150.0,
+            base_path: Default::default(),
+            has_parent_object: false,
+        });
+
+        ui.send(self.component_inspector, InspectorMessage::Context(context));
     }
 
     fn rebuild_action_menu_items(&mut self, ui: &mut UserInterface, filter: &str) {
@@ -791,13 +1290,14 @@ impl BlueprintEditor {
                 .map(|n| format!("Blueprint [UX-2025-12-16] - {}", n.to_string_lossy()))
                 .unwrap_or_else(|| "Blueprint [UX-2025-12-16]".to_string());
 
-            let ui = editor.engine.user_interfaces.first_mut();
-            ui.send(
-                self.window,
-                WindowMessage::Title(WindowTitle::text(title)),
-            );
-
-            self.reload_from_resource(&editor.engine.resource_manager, ui);
+            {
+                let ui = editor.engine.user_interfaces.first_mut();
+                ui.send(
+                    self.window,
+                    WindowMessage::Title(WindowTitle::text(title)),
+                );
+            }
+            self.reload_from_resource(&mut editor.engine);
         }
 
         let ui = editor.engine.user_interfaces.first_mut();
@@ -815,9 +1315,12 @@ impl BlueprintEditor {
         );
     }
 
-    fn reload_from_resource(&mut self, resource_manager: &ResourceManager, ui: &mut UserInterface) {
+    fn reload_from_resource(&mut self, engine: &mut Engine) {
         // Extra tabs belong to a single opened blueprint; discard them on reload.
-        self.close_all_extra_tabs(ui);
+        {
+            let ui = engine.user_interfaces.first_mut();
+            self.close_all_extra_tabs(ui);
+        }
 
         let Some(path) = self.path.as_ref() else {
             return;
@@ -831,11 +1334,14 @@ impl BlueprintEditor {
             return;
         };
 
+        let resource_manager = engine.resource_manager.clone();
+
         match block_on(resource_manager.request::<BlueprintAsset>(relative)) {
             Ok(resource) => {
                 let guard = resource.data_ref();
                 if let Some(asset) = guard.as_loaded_ref() {
                     self.version = asset.version;
+                    self.prefab_path = asset.prefab_path.clone();
 
                     match serde_json::from_str::<BlueprintGraph>(&asset.graph_json) {
                         Ok(graph) => {
@@ -859,11 +1365,23 @@ impl BlueprintEditor {
 
                     self.sync_variable_node_pin_types();
 
-                    self.rebuild_all_graph_views(ui);
-                    self.rebuild_graphs_panel(ui);
-                    self.rebuild_variables_panel(ui);
-                    self.rebuild_functions_panel(ui);
-                    self.set_selected_node(ui, None);
+                    {
+                        let ui = engine.user_interfaces.first_mut();
+                        self.rebuild_all_graph_views(ui);
+                        self.rebuild_graphs_panel(ui);
+                        self.rebuild_variables_panel(ui);
+                        self.rebuild_functions_panel(ui);
+                        self.set_selected_node(ui, None);
+                    }
+
+                    // Refresh preview actor (Viewport/Components).
+                    if self.prefab_path.is_some() {
+                        self.load_preview_prefab(engine);
+                    } else {
+                        self.clear_preview_actor(engine);
+                    }
+                    self.rebuild_components_tree(engine);
+                    self.set_component_selection(engine, self.preview_actor_root);
                 } else {
                     Log::err("BlueprintEditor: blueprint asset is not loaded".to_string());
                 }
@@ -1531,13 +2049,13 @@ impl BlueprintEditor {
             GraphKind::Event => {
                 self.active_extra_tab = None;
                 self.active_tab = BlueprintGraphTab::EventGraph;
-                ui.send(self.tab_control, TabControlMessage::ActiveTab(Some(0)));
+                ui.send(self.tab_control, TabControlMessage::ActiveTab(Some(1)));
                 return;
             }
             GraphKind::Construction => {
                 self.active_extra_tab = None;
                 self.active_tab = BlueprintGraphTab::ConstructionScript;
-                ui.send(self.tab_control, TabControlMessage::ActiveTab(Some(1)));
+                ui.send(self.tab_control, TabControlMessage::ActiveTab(Some(2)));
                 return;
             }
             _ => {}
@@ -1545,7 +2063,7 @@ impl BlueprintEditor {
 
         if let Some(i) = self.extra_tabs.iter().position(|t| t.name == name) {
             self.active_extra_tab = Some(i);
-            ui.send(self.tab_control, TabControlMessage::ActiveTab(Some(2 + i)));
+            ui.send(self.tab_control, TabControlMessage::ActiveTab(Some(3 + i)));
             return;
         }
 
@@ -2052,10 +2570,27 @@ impl BlueprintEditor {
             }
         };
 
+        // Ensure we have a prefab path and save current preview actor as a prefab scene.
+        let prefab_abs = self
+            .prefab_absolute_path()
+            .unwrap_or_else(|| path.with_extension("rgs"));
+
+        if self.prefab_path.is_none() {
+            self.prefab_path = make_relative_path(&prefab_abs)
+                .ok()
+                .and_then(|p| p.to_str().map(|s| s.to_string()))
+                .or_else(|| Some(prefab_abs.to_string_lossy().to_string()));
+        }
+
+        if let Err(err) = self.save_preview_prefab(&prefab_abs, engine) {
+            Log::err(format!("BlueprintEditor: failed to save prefab: {err}"));
+            return;
+        }
+
         let mut asset = BlueprintAsset {
             version: self.version,
             graph_json,
-            prefab_path: None,
+            prefab_path: self.prefab_path.clone(),
         };
 
         if let Err(err) = asset.save(path) {
@@ -2114,9 +2649,184 @@ impl BlueprintEditor {
             }
         }
 
+        // Components panel selection -> update Details inspector (Viewport tab).
+        if let Some(TreeRootMessage::Select(selection)) =
+            message.data_from::<TreeRootMessage>(self.components_tree_root)
+        {
+            if let Some(item) = selection.first().copied() {
+                if let Some(node) = self.components_item_to_node.get(&item).copied() {
+                    self.set_component_selection(engine, node);
+                }
+            }
+        }
+
+        // Viewport camera controls (mouse orbit/pan/zoom) on the viewport image.
+        if message.destination() == self.viewport_image {
+            if let Some(WidgetMessage::MouseDown { pos, button }) = message.data() {
+                match button {
+                    MouseButton::Right => {
+                        self.viewport_drag = Some(ViewportDragMode::Orbit);
+                        self.viewport_last_pos = Some(*pos);
+                    }
+                    MouseButton::Middle => {
+                        self.viewport_drag = Some(ViewportDragMode::Pan);
+                        self.viewport_last_pos = Some(*pos);
+                    }
+                    _ => {}
+                }
+            } else if let Some(WidgetMessage::MouseUp { button, .. }) = message.data() {
+                match button {
+                    MouseButton::Right | MouseButton::Middle => {
+                        self.viewport_drag = None;
+                        self.viewport_last_pos = None;
+                    }
+                    _ => {}
+                }
+            } else if let Some(WidgetMessage::MouseMove { pos, .. }) = message.data() {
+                if let (Some(mode), Some(last)) = (self.viewport_drag, self.viewport_last_pos) {
+                    let delta = *pos - last;
+                    self.viewport_last_pos = Some(*pos);
+
+                    match mode {
+                        ViewportDragMode::Orbit => {
+                            self.viewport_yaw += delta.x * 0.01;
+                            self.viewport_pitch =
+                                (self.viewport_pitch + delta.y * 0.01).clamp(-1.55, 1.55);
+                        }
+                        ViewportDragMode::Pan => {
+                            // Pan in camera local space.
+                            let rot = UnitQuaternion::from_euler_angles(
+                                self.viewport_pitch,
+                                self.viewport_yaw,
+                                0.0,
+                            );
+                            let right = rot * Vector3::new(1.0, 0.0, 0.0);
+                            let up = rot * Vector3::new(0.0, 1.0, 0.0);
+                            let scale = (self.viewport_distance.max(0.25)) * 0.002;
+                            self.viewport_target += (-delta.x * scale) * right + (delta.y * scale) * up;
+                        }
+                    }
+
+                    self.apply_viewport_camera(engine);
+                }
+            } else if let Some(WidgetMessage::MouseWheel { amount, .. }) = message.data() {
+                let factor = 1.0 - (*amount * 0.1);
+                self.viewport_distance = (self.viewport_distance * factor).clamp(0.25, 250.0);
+                self.apply_viewport_camera(engine);
+            }
+        }
+
+        // Details edits for selected component.
+        if let Some(InspectorMessage::PropertyChanged(args)) =
+            message.data_from::<InspectorMessage>(self.component_inspector)
+        {
+            if let Some(selected) = self.selected_component {
+                let scene = &mut engine.scenes[self.preview_scene];
+                if let Some(node) = scene.graph.try_get_node_mut(selected) {
+                    match PropertyAction::from_field_kind(&args.value) {
+                        PropertyAction::Modify { value } => {
+                            let path = args.path();
+                            let mut value = Some(value);
+                            node.resolve_path_mut(&path, &mut |result| {
+                                if let Ok(property) = result {
+                                    if let Some(value) = value.take() {
+                                        let _ = property.set(value);
+                                    }
+                                }
+                            });
+                        }
+                        _ => {
+                            // For now we only need Modify for a usable Details panel.
+                        }
+                    }
+                }
+            }
+        }
+
         if let Some(ButtonMessage::Click) = message.data() {
             if message.destination() == self.save {
                 self.save_to_disk(engine);
+            }
+
+            if message.destination() == self.add_component {
+                let ui = engine.user_interfaces.first_mut();
+                ui.send(
+                    self.add_component_menu,
+                    PopupMessage::Placement(Placement::LeftBottom(self.add_component)),
+                );
+                ui.send(self.add_component_menu, PopupMessage::Open);
+            }
+
+            if let Some(kind) = self
+                .add_component_button_actions
+                .get(&message.destination())
+                .copied()
+            {
+                let parent = self.selected_component.unwrap_or(self.preview_actor_root);
+
+                let scene = &mut engine.scenes[self.preview_scene];
+                if !scene.graph.is_valid_handle(parent) {
+                    return;
+                }
+
+                let new_node = match kind {
+                    AddComponentKind::SceneComponent => {
+                        PivotBuilder::new(BaseBuilder::new().with_name("SceneComponent"))
+                            .build(&mut scene.graph)
+                    }
+                    AddComponentKind::StaticMesh => {
+                        crate::fyrox::scene::mesh::MeshBuilder::new(
+                            BaseBuilder::new().with_name("StaticMesh"),
+                        )
+                        .build(&mut scene.graph)
+                    }
+                    AddComponentKind::Camera => {
+                        CameraBuilder::new(BaseBuilder::new().with_name("Camera"))
+                            .build(&mut scene.graph)
+                    }
+                    AddComponentKind::DirectionalLight => {
+                        DirectionalLightBuilder::new(
+                            BaseLightBuilder::new(BaseBuilder::new().with_name("DirectionalLight")),
+                        )
+                        .build(&mut scene.graph)
+                    }
+                    AddComponentKind::PointLight => {
+                        crate::fyrox::scene::light::point::PointLightBuilder::new(
+                            BaseLightBuilder::new(BaseBuilder::new().with_name("PointLight")),
+                        )
+                        .build(&mut scene.graph)
+                    }
+                    AddComponentKind::SpotLight => {
+                        crate::fyrox::scene::light::spot::SpotLightBuilder::new(
+                            BaseLightBuilder::new(BaseBuilder::new().with_name("SpotLight")),
+                        )
+                        .build(&mut scene.graph)
+                    }
+                    AddComponentKind::RigidBody => {
+                        crate::fyrox::scene::rigidbody::RigidBodyBuilder::new(
+                            BaseBuilder::new().with_name("RigidBody"),
+                        )
+                        .build(&mut scene.graph)
+                    }
+                    AddComponentKind::Collider => {
+                        crate::fyrox::scene::collider::ColliderBuilder::new(
+                            BaseBuilder::new().with_name("Collider"),
+                        )
+                        .build(&mut scene.graph)
+                    }
+                };
+
+                scene.graph.link_nodes(new_node, parent);
+                scene.graph.update_hierarchical_data();
+
+                {
+                    let ui = engine.user_interfaces.first_mut();
+                    ui.send(self.add_component_menu, PopupMessage::Close);
+                }
+
+                self.rebuild_components_tree(engine);
+                self.set_component_selection(engine, new_node);
+                self.select_component_in_tree(engine, new_node);
             }
 
             if let Some(action) = self
@@ -2220,7 +2930,7 @@ impl BlueprintEditor {
                 engine
                     .user_interfaces
                     .first_mut()
-                    .send(self.tab_control, TabControlMessage::ActiveTab(Some(0)));
+                    .send(self.tab_control, TabControlMessage::ActiveTab(Some(1)));
             }
 
             if message.destination() == self.my_blueprint_graphs_construction {
@@ -2229,7 +2939,7 @@ impl BlueprintEditor {
                 engine
                     .user_interfaces
                     .first_mut()
-                    .send(self.tab_control, TabControlMessage::ActiveTab(Some(1)));
+                    .send(self.tab_control, TabControlMessage::ActiveTab(Some(2)));
             }
 
             if let Some(&graph_index) = self.my_blueprint_graph_select.get(&message.destination()) {
@@ -2285,14 +2995,28 @@ impl BlueprintEditor {
 
         if let Some(TabControlMessage::ActiveTab(Some(index))) = message.data() {
             if message.destination() == self.tab_control {
+                let ui = engine.user_interfaces.first_mut();
+
+                // Viewport tab uses the component inspector in Details.
                 if *index == 0 {
                     self.active_extra_tab = None;
+                    ui.send(self.details_graph_root, WidgetMessage::Visibility(false));
+                    ui.send(self.details_component_root, WidgetMessage::Visibility(true));
+                    return;
+                }
+
+                // Graph tabs use the existing graph details panel.
+                ui.send(self.details_graph_root, WidgetMessage::Visibility(true));
+                ui.send(self.details_component_root, WidgetMessage::Visibility(false));
+
+                if *index == 1 {
+                    self.active_extra_tab = None;
                     self.active_tab = BlueprintGraphTab::EventGraph;
-                } else if *index == 1 {
+                } else if *index == 2 {
                     self.active_extra_tab = None;
                     self.active_tab = BlueprintGraphTab::ConstructionScript;
                 } else {
-                    let extra_index = index.saturating_sub(2);
+                    let extra_index = index.saturating_sub(3);
                     if extra_index < self.extra_tabs.len() {
                         self.active_extra_tab = Some(extra_index);
                     } else {
@@ -2899,7 +3623,7 @@ impl EditorPlugin for BlueprintEditorPlugin {
 
         let bp = self
             .editor
-            .get_or_insert_with(|| BlueprintEditor::new(&mut editor.engine));
+            .get_or_insert_with(|| BlueprintEditor::new(&mut editor.engine, editor.message_sender.clone()));
         bp.open(editor, path.clone());
     }
 }
