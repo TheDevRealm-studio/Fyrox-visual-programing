@@ -1,4 +1,5 @@
 use crate::{
+    asset::preview::cache::IconRequest,
     fyrox::{
         asset::io::FsResourceIo,
         asset::ResourceData,
@@ -67,6 +68,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     sync::Arc,
+    sync::mpsc::Sender,
 };
 
 use crate::plugins::absm::{
@@ -77,6 +79,7 @@ use crate::plugins::absm::{
 };
 
 use crate::plugins::inspector::editors::make_property_editors_container;
+use crate::plugins::inspector::EditorEnvironment;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ViewportDragMode {
@@ -229,6 +232,8 @@ struct BlueprintEditor {
     details_component_root: Handle<UiNode>,
     component_inspector: Handle<UiNode>,
     property_editors: Arc<fyrox::gui::inspector::editors::PropertyEditorDefinitionContainer>,
+    sender: MessageSender,
+    icon_request_sender: Sender<IconRequest>,
 
     my_blueprint_graphs_event: fyrox::core::pool::Handle<UiNode>,
     my_blueprint_graphs_construction: fyrox::core::pool::Handle<UiNode>,
@@ -293,9 +298,9 @@ impl BlueprintEditor {
         tab_graph_name(self.active_tab)
     }
 
-    fn new(engine: &mut Engine, sender: MessageSender) -> Self {
+    fn new(engine: &mut Engine, sender: MessageSender, icon_request_sender: Sender<IconRequest>) -> Self {
         let property_editors = Arc::new(make_property_editors_container(
-            sender,
+            sender.clone(),
             engine.resource_manager.clone(),
         ));
 
@@ -632,11 +637,19 @@ impl BlueprintEditor {
 
         // Component inspector (used in Viewport tab).
         let dummy_node = SceneNode::from(Pivot::default());
+        let environment = Arc::new(EditorEnvironment {
+            resource_manager: engine.resource_manager.clone(),
+            serialization_context: engine.serialization_context.clone(),
+            available_animations: Default::default(),
+            sender: sender.clone(),
+            icon_request_sender: icon_request_sender.clone(),
+            style: None,
+        });
         let component_inspector_context = InspectorContext::from_object(InspectorContextArgs {
             object: &dummy_node,
             ctx,
             definition_container: property_editors.clone(),
-            environment: None,
+            environment: Some(environment),
             layer_index: 0,
             generate_property_string_values: true,
             filter: Default::default(),
@@ -812,6 +825,8 @@ impl BlueprintEditor {
             details_component_root,
             component_inspector,
             property_editors,
+            sender,
+            icon_request_sender,
 
             my_blueprint_graphs_event,
             my_blueprint_graphs_construction,
@@ -1085,11 +1100,20 @@ impl BlueprintEditor {
             return;
         }
 
+        let environment = Arc::new(EditorEnvironment {
+            resource_manager: engine.resource_manager.clone(),
+            serialization_context: engine.serialization_context.clone(),
+            available_animations: Default::default(),
+            sender: self.sender.clone(),
+            icon_request_sender: self.icon_request_sender.clone(),
+            style: None,
+        });
+
         let context = InspectorContext::from_object(InspectorContextArgs {
             object: &scene.graph[node],
             ctx: &mut ui.build_ctx(),
             definition_container: self.property_editors.clone(),
-            environment: None,
+            environment: Some(environment),
             layer_index: 0,
             generate_property_string_values: true,
             filter: Default::default(),
@@ -3623,7 +3647,13 @@ impl EditorPlugin for BlueprintEditorPlugin {
 
         let bp = self
             .editor
-            .get_or_insert_with(|| BlueprintEditor::new(&mut editor.engine, editor.message_sender.clone()));
+            .get_or_insert_with(|| {
+                BlueprintEditor::new(
+                    &mut editor.engine,
+                    editor.message_sender.clone(),
+                    editor.asset_browser.preview_sender.clone(),
+                )
+            });
         bp.open(editor, path.clone());
     }
 }

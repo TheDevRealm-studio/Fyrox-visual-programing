@@ -1,5 +1,8 @@
 FTAX:0;
 __ROOT__[]
 {
-	Blueprint[Version<u32:1>GraphJson<str:"{\"id\":\"Blueprint\",\"graphs\":[{\"name\":\"EventGraph\",\"kind\":\"Event\"},{\"name\":\"ConstructionScript\",\"kind\":\"Construction\"}],\"nodes\":{},\"links\":[],\"variables\":[],\"next_node_id\":1,\"next_pin_id\":1}">]{}
+	Blueprint[Version<u32:1>GraphJson<str:"{\n  \"id\": \"Blueprint\",\n  \"graphs\": [\n    {\n      \"name\": \"EventGraph\",\n      \"kind\": \"Event\"\n    },\n    {\n      \"name\": \"ConstructionScript\",\n      \"kind\": \"Construction\"\n    }\n  ],\n  \"nodes\": {\n    \"1\": {\n      \"id\": 1,\n      \"kind\": \"BeginPlay\",\n      \"graph\": \"EventGraph\",\n      \"position\": [\n        50.0,\n        50.0\n      ],\n      \"pins\": [\n        {\n          \"id\": 1,\n          \"name\": \"then\",\n          \"direction\": \"Output\",\n          \"data_type\": \"Exec\"\n        }\n      ],\n      \"properties\": {}\n    },\n    \"2\": {\n      \"id\": 2,\n      \"kind\": \"Print\",\n      \"graph\": \"EventGraph\",\n      \"position\": [\n        350.0,\n        50.0\n      ],\n      \"pins\": [\n        {\n          \"id\": 2,\n          \"name\": \"exec\",\n          \"direction\": \"Input\",\n          \"data_type\": \"Exec\"\n        },\n        {\n          \"id\": 3,\n          \"name\": \"then\",\n          \"direction\": \"Output\",\n          \"data_type\": \"Exec\"\n        },\n        {\n          \"id\": 4,\n          \"name\": \"text\",\n          \"direction\": \"Input\",\n          \"data_type\": \"String\"\n        }\n      ],\n      \"properties\": {\n        \"text\": {\n          \"String\": \"Hello\"\n        }\n      }\n    }\n  },\n  \"links\": [\n    {\n      \"from\": 1,\n      \"to\": 2\n    }\n  ],\n  \"variables\": [],\n  \"next_node_id\": 3,\n  \"next_pin_id\": 5\n}">]
+	{
+		PrefabPath[IsSome<u8:1>Data<str:"data/bluepijt/Blueprint_1.rgs">]{}
+	}
 }
